@@ -228,37 +228,28 @@ async def health_check():
 
 @app.get("/api/proxy-download")
 async def proxy_download(url: str):
-    """Streams the raw video bytes asynchronously to avoid blocking the Uvicorn worker thread."""
+    """Streams video bytes straight from TikTok CDN using httpx chunking."""
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
         "Referer": "https://www.tiktok.com/",
         "Accept": "*/*",
-        "Accept-Encoding": "identity",
     }
-    
-    proxy_config = None
-    if DATAIMPULSE_PROXY and DATAIMPULSE_PROXY.strip():
-        p_str = DATAIMPULSE_PROXY.strip()
-        if p_str.startswith("https://"):
-            p_str = "http://" + p_str[8:]
-        elif not p_str.startswith("http://"):
-            p_str = "http://" + p_str
-        proxy_config = p_str
 
-    async def stream_chunks():
-        async with httpx.AsyncClient(proxy=proxy_config, follow_redirects=True, timeout=60.0) as client:
+    async def stream_cdn():
+        async with httpx.AsyncClient(follow_redirects=True, timeout=60.0) as client:
             async with client.stream("GET", url, headers=headers) as response:
                 if response.status_code not in (200, 206):
-                    raise HTTPException(status_code=400, detail="Failed to stream video stream from CDN.")
-                async for chunk in response.aiter_bytes(chunk_size=128 * 1024):
+                    raise HTTPException(status_code=400, detail="Failed to stream from CDN.")
+                async for chunk in response.aiter_bytes(chunk_size=256 * 1024):
                     yield chunk
 
     return StreamingResponse(
-        stream_chunks(),
+        stream_cdn(),
         media_type="video/mp4",
         headers={
             "Content-Disposition": 'attachment; filename="tiktok_video.mp4"',
             "Content-Type": "video/mp4",
+            "Access-Control-Allow-Origin": "*"
         }
     )
 
