@@ -24,15 +24,6 @@ app = FastAPI(
 )
 
 # CORS Configuration with Exposed Headers for Mobile Media Streaming
-ORIGINS = [
-    "https://savetokhd.com",
-    "https://www.savetokhd.com",
-    "http://localhost:3000",
-    "http://127.0.0.1:5500",
-    "http://localhost:8000",
-    "http://127.0.0.1:8000",
-]
-
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],  # Permits requests from Cloudflare Pages frontend
@@ -229,7 +220,7 @@ async def health_check():
 
 @app.get("/api/proxy-download")
 async def proxy_download(url: str):
-    """Streams raw video bytes from TikTok CDN with attachment headers."""
+    """Streams raw video bytes from TikTok CDN with clean stream disconnect handling."""
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
         "Referer": "https://www.tiktok.com/",
@@ -237,12 +228,16 @@ async def proxy_download(url: str):
     }
 
     async def stream_cdn():
-        async with httpx.AsyncClient(follow_redirects=True, timeout=60.0) as client:
-            async with client.stream("GET", url, headers=headers) as response:
-                if response.status_code not in (200, 206):
-                    raise HTTPException(status_code=400, detail="Failed to stream from CDN.")
-                async for chunk in response.aiter_bytes(chunk_size=256 * 1024):
-                    yield chunk
+        try:
+            async with httpx.AsyncClient(follow_redirects=True, timeout=30.0) as client:
+                async with client.stream("GET", url, headers=headers) as response:
+                    if response.status_code not in (200, 206):
+                        return
+                    async for chunk in response.aiter_bytes(chunk_size=256 * 1024):
+                        yield chunk
+        except (httpx.RequestError, asyncio.CancelledError, Exception):
+            # Catches client disconnects or prematurely closed streams to prevent ASGI crashes
+            return
 
     return StreamingResponse(
         stream_cdn(),
