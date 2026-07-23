@@ -4,15 +4,13 @@ import re
 from typing import Optional, List
 from fastapi import FastAPI, HTTPException, status
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, HttpUrl
+from pydantic import BaseModel
 import yt_dlp
 
 # =====================================================================
 # CONFIGURATION & PROXY SETUP
 # =====================================================================
 
-# Proxy string provided: 
-# Proxy configuration loaded securely from environment variables
 DATAIMPULSE_PROXY = os.getenv("PROXY_URL")
 
 app = FastAPI(
@@ -21,7 +19,7 @@ app = FastAPI(
     version="1.0.0"
 )
 
-# CORS Configuration for domain setup
+# CORS Configuration
 ORIGINS = [
     "https://savetokhd.com",
     "https://www.savetokhd.com",
@@ -70,8 +68,15 @@ class BulkExtractResponse(BaseModel):
     videos: List[BulkVideoItem]
 
 # =====================================================================
-# HELPER FUNCTIONS
+# HELPER FUNCTIONS & SANITIZERS
 # =====================================================================
+
+def clean_tiktok_url(text: str) -> str:
+    """Extracts the first valid HTTP/HTTPS URL from user input, removing app share clutter."""
+    match = re.search(r'https?://[^\s]+', text)
+    if match:
+        return match.group(0)
+    return text.strip()
 
 def format_count(count: Optional[int]) -> str:
     """Format view counts into readable K/M strings."""
@@ -91,17 +96,19 @@ def format_duration(seconds: Optional[float]) -> str:
     return f"{mins:02d}:{secs:02d}"
 
 def get_common_yt_dlp_opts() -> dict:
-    """Base options with DataImpulse proxy rotation configured."""
-    return {
-        'proxy': DATAIMPULSE_PROXY,
+    """Base options with proxy rotation configured."""
+    opts = {
         'quiet': True,
         'no_warnings': True,
         'ignoreerrors': True,
         'socket_timeout': 15,
     }
+    if DATAIMPULSE_PROXY:
+        opts['proxy'] = DATAIMPULSE_PROXY
+    return opts
 
 # =====================================================================
-# CORE SYNCHRONOUS EXTRACTORS (Run via Async Threading)
+# CORE SYNCHRONOUS EXTRACTORS
 # =====================================================================
 
 def _sync_download_single(video_url: str) -> dict:
@@ -115,7 +122,6 @@ def _sync_download_single(video_url: str) -> dict:
         if not info:
             raise ValueError("Unable to retrieve video metadata.")
 
-        # Resolve direct download URL
         download_url = info.get('url')
         if not download_url and 'requested_formats' in info:
             download_url = info['requested_formats'][0].get('url')
@@ -178,15 +184,17 @@ async def health_check():
 
 @app.post("/api/download-single", response_model=SingleVideoResponse)
 async def api_download_single(payload: SingleVideoRequest):
-    if "tiktok.com" not in payload.url:
+    # Extract clean URL from messy input
+    sanitized_url = clean_tiktok_url(payload.url)
+
+    if "tiktok.com" not in sanitized_url:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST, 
             detail="Invalid URL. Please enter a valid TikTok link."
         )
 
     try:
-        # Offload sync yt-dlp operation to threadpool to stay async non-blocking
-        data = await asyncio.to_thread(_sync_download_single, payload.url)
+        data = await asyncio.to_thread(_sync_download_single, sanitized_url)
         return data
     except Exception as e:
         raise HTTPException(
@@ -203,7 +211,6 @@ async def api_extract_bulk(payload: BulkExtractRequest):
         )
 
     try:
-        # Offload sync yt-dlp profile extraction to threadpool
         data = await asyncio.to_thread(_sync_extract_bulk, payload.username)
         return data
     except Exception as e:
