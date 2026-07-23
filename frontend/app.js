@@ -53,43 +53,46 @@ function escapeHTML(str) {
     return div.innerHTML;
 }
 
-// --- Background File Streamer (Prevents Redirection) ---
+// --- Background File Streamer (Mobile-Safe Iframe Method) ---
 
 /**
- * Streams the video as a blob in the background and triggers save-dialog on savetokhd.com
+ * Triggers video stream download without redirecting or navigating away from savetokhd.com
  * @param {string} proxiedUrl 
  * @param {HTMLElement} buttonElement 
  */
-async function downloadVideoFile(proxiedUrl, buttonElement) {
+function downloadVideoFile(proxiedUrl, buttonElement) {
     const originalHTML = buttonElement.innerHTML;
-    
+
     try {
         buttonElement.disabled = true;
         buttonElement.innerHTML = `<i data-lucide="loader-2" class="w-5 h-5 animate-spin"></i> Downloading...`;
-        lucide.createIcons();
+        if (window.lucide) lucide.createIcons();
 
-        const response = await fetch(proxiedUrl);
-        if (!response.ok) throw new Error("Stream error from server.");
+        // Create an invisible iframe to handle stream prompt natively without leaving page
+        const iframe = document.createElement("iframe");
+        iframe.style.display = "none";
+        iframe.src = proxiedUrl;
+        document.body.appendChild(iframe);
 
-        const blob = await response.blob();
-        const tempUrl = window.URL.createObjectURL(blob);
+        // Reset button state after 4 seconds once stream starts
+        setTimeout(() => {
+            buttonElement.disabled = false;
+            buttonElement.innerHTML = originalHTML;
+            if (window.lucide) lucide.createIcons();
+            // Cleanup iframe DOM element after delay
+            setTimeout(() => {
+                if (document.body.contains(iframe)) {
+                    document.body.removeChild(iframe);
+                }
+            }, 60000); 
+        }, 4000);
 
-        const a = document.createElement("a");
-        a.style.display = "none";
-        a.href = tempUrl;
-        a.download = `tiktok_video_${new Date().getTime()}.mp4`;
-        document.body.appendChild(a);
-        a.click();
-
-        window.URL.revokeObjectURL(tempUrl);
-        document.body.removeChild(a);
     } catch (err) {
         alert("Download failed. Please try again.");
         console.error("File download error:", err);
-    } finally {
         buttonElement.disabled = false;
         buttonElement.innerHTML = originalHTML;
-        lucide.createIcons();
+        if (window.lucide) lucide.createIcons();
     }
 }
 
@@ -203,7 +206,7 @@ function renderSingleResult(data) {
     `;
     lucide.createIcons();
 
-    // Attach click listener for background file streaming
+    // Attach click listener for background streaming
     document.getElementById('btn-download-media').addEventListener('click', function() {
         const downloadUrl = this.getAttribute('data-url');
         downloadVideoFile(downloadUrl, this);
