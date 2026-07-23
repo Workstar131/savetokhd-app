@@ -39,7 +39,7 @@ app.add_middleware(
 )
 
 # =====================================================================
-# SCHEMAS (Matches Frontend Javascript Payloads)
+# SCHEMAS
 # =====================================================================
 
 class SingleVideoRequest(BaseModel):
@@ -69,33 +69,32 @@ class BulkExtractResponse(BaseModel):
     videos: List[BulkVideoItem]
 
 # =====================================================================
-# HELPER FUNCTIONS & SANITIZERS
+# HELPER FUNCTIONS
 # =====================================================================
 
 def clean_tiktok_url(text: str) -> str:
-    """Extracts valid HTTP/HTTPS URL and unspools short links using GET requests."""
+    """Extracts valid HTTP/HTTPS URL and resolves short links."""
     match = re.search(r'https?://[^\s]+', text)
     if not match:
         return text.strip()
 
     url = match.group(0)
 
-    # TikTok blocks HEAD requests; use GET with mobile headers to unroll redirects
     if "vm.tiktok.com" in url or "vt.tiktok.com" in url:
         try:
             headers = {
-                "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 16_6 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.6 Mobile/15E148 Safari/604.1"
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
             }
-            with httpx.Client(follow_redirects=True, timeout=10.0, headers=headers) as client:
+            with httpx.Client(follow_redirects=True, timeout=8.0, headers=headers) as client:
                 res = client.get(url)
-                url = str(res.url)
+                if res.status_code == 200:
+                    url = str(res.url)
         except Exception:
             pass
 
     return url
 
 def format_count(count: Optional[int]) -> str:
-    """Format view counts into readable K/M strings."""
     if not count:
         return "N/A"
     if count >= 1_000_000:
@@ -105,29 +104,24 @@ def format_count(count: Optional[int]) -> str:
     return str(count)
 
 def format_duration(seconds: Optional[float]) -> str:
-    """Format duration into MM:SS."""
     if not seconds:
         return "00:00"
     mins, secs = divmod(int(seconds), 60)
     return f"{mins:02d}:{secs:02d}"
 
 def get_common_yt_dlp_opts() -> dict:
-    """Base options simulating modern mobile browsers."""
+    """Options with realistic browser headers to bypass block lists."""
     opts = {
         'quiet': True,
         'no_warnings': True,
-        'ignoreerrors': True,
+        'ignoreerrors': False,
         'socket_timeout': 15,
-        'extractor_args': {
-            'tiktok': {
-                'app_version': '32.5.3',
-                'manifest_app_version': '32.5.3',
-            }
-        },
+        'geo_bypass': True,
         'http_headers': {
-            'User-Agent': 'Mozilla/5.0 (iPhone; CPU iPhone OS 16_6 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.6 Mobile/15E148 Safari/604.1',
-            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-            'Accept-Language': 'en-US,en;q=0.5',
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36',
+            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
+            'Accept-Language': 'en-US,en;q=0.9',
+            'Sec-Fetch-Mode': 'navigate',
         }
     }
     if DATAIMPULSE_PROXY:
@@ -135,19 +129,19 @@ def get_common_yt_dlp_opts() -> dict:
     return opts
 
 # =====================================================================
-# CORE SYNCHRONOUS EXTRACTORS
+# SYNCHRONOUS EXTRACTORS
 # =====================================================================
 
 def _sync_download_single(video_url: str) -> dict:
     opts = get_common_yt_dlp_opts()
     opts.update({
-        'format': 'bestvideo+bestaudio/best',
+        'format': 'best',
     })
 
     with yt_dlp.YoutubeDL(opts) as ydl:
         info = ydl.extract_info(video_url, download=False)
         if not info:
-            raise ValueError("Unable to retrieve video metadata.")
+            raise ValueError("TikTok blocked metadata extraction for this link.")
 
         download_url = info.get('url')
         if not download_url and 'requested_formats' in info:
@@ -205,18 +199,16 @@ def _sync_extract_bulk(username: str) -> dict:
 # API ENDPOINTS
 # =====================================================================
 
-
 @app.get("/api/health")
 async def health_check():
     return {
-        "status": "online",
-        "domain": "savetokhd.com",
+        "status": "online", 
+        "domain": "savetokhd.com", 
         "yt_dlp_version": yt_dlp.version.__version__
     }
 
 @app.post("/api/download-single", response_model=SingleVideoResponse)
 async def api_download_single(payload: SingleVideoRequest):
-    # Sanitize text and unroll shortlinks
     sanitized_url = clean_tiktok_url(payload.url)
 
     if "tiktok.com" not in sanitized_url:
@@ -231,7 +223,7 @@ async def api_download_single(payload: SingleVideoRequest):
     except Exception as e:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Failed to process video: {str(e)}"
+            detail=f"Error: {str(e)}"
         )
 
 @app.post("/api/extract-bulk", response_model=BulkExtractResponse)
@@ -248,5 +240,5 @@ async def api_extract_bulk(payload: BulkExtractRequest):
     except Exception as e:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Failed to extract profile: {str(e)}"
+            detail=f"Error: {str(e)}"
         )
