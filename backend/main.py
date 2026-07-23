@@ -114,13 +114,19 @@ def format_duration(seconds: Optional[float]) -> str:
     return f"{mins:02d}:{secs:02d}"
 
 def get_common_yt_dlp_opts() -> dict:
-    """Options with realistic browser headers to bypass block lists."""
+    """Options with realistic browser headers and mobile API fallback to bypass TikTok blocks."""
     opts = {
         'quiet': True,
         'no_warnings': True,
         'ignoreerrors': False,
         'socket_timeout': 15,
         'geo_bypass': True,
+        'extractor_args': {
+            'tiktok': {
+                'app_version': '31.5.3',
+                'manifest_app_version': '3153',
+            }
+        },
         'http_headers': {
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36',
             'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
@@ -129,11 +135,8 @@ def get_common_yt_dlp_opts() -> dict:
         }
     }
     
-    # Check if PROXY_URL is populated
     if DATAIMPULSE_PROXY and DATAIMPULSE_PROXY.strip():
         proxy_str = DATAIMPULSE_PROXY.strip()
-        
-        # yt-dlp urllib does NOT support https:// proxy protocols.
         if proxy_str.startswith("https://"):
             proxy_str = "http://" + proxy_str[8:]
         elif not proxy_str.startswith("http://"):
@@ -144,13 +147,29 @@ def get_common_yt_dlp_opts() -> dict:
     return opts
 
 def iterfile(url: str) -> Generator[bytes, None, None]:
-    """Streams video chunks synchronously from TikTok to avoid async socket drops."""
+    """Streams video chunks through the proxy with complete browser headers to bypass CDN 403 blocks."""
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
         "Referer": "https://www.tiktok.com/",
         "Accept": "*/*",
+        "Accept-Encoding": "identity",
+        "Range": "bytes=0-",
     }
-    with requests.get(url, headers=headers, stream=True, timeout=30) as r:
+    
+    proxies = None
+    if DATAIMPULSE_PROXY and DATAIMPULSE_PROXY.strip():
+        p_str = DATAIMPULSE_PROXY.strip()
+        if p_str.startswith("https://"):
+            p_str = "http://" + p_str[8:]
+        elif not p_str.startswith("http://"):
+            p_str = "http://" + p_str
+        
+        proxies = {
+            "http": p_str,
+            "https": p_str
+        }
+
+    with requests.get(url, headers=headers, proxies=proxies, stream=True, timeout=30) as r:
         r.raise_for_status()
         for chunk in r.iter_content(chunk_size=128 * 1024):
             if chunk:
@@ -175,7 +194,6 @@ def _sync_download_single(video_url: str) -> dict:
         if not raw_download_url and 'requested_formats' in info:
             raw_download_url = info['requested_formats'][0].get('url')
 
-        # Encode full raw CDN URL for backend proxy stream
         proxied_url = f"https://savetokhd-app.onrender.com/api/proxy-download?url={quote(raw_download_url or video_url)}"
 
         return {
