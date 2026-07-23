@@ -124,8 +124,11 @@ def get_common_yt_dlp_opts() -> dict:
             'Sec-Fetch-Mode': 'navigate',
         }
     }
-    if DATAIMPULSE_PROXY:
-        opts['proxy'] = DATAIMPULSE_PROXY
+    
+    # Check for non-empty string to avoid empty-proxy urllib error
+    if DATAIMPULSE_PROXY and DATAIMPULSE_PROXY.strip():
+        opts['proxy'] = DATAIMPULSE_PROXY.strip()
+
     return opts
 
 # =====================================================================
