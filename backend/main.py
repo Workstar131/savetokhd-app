@@ -1,7 +1,7 @@
 import asyncio
 import os
 import re
-from typing import Optional, List, Generator
+from typing import Optional, List
 from urllib.parse import quote
 
 from fastapi import FastAPI, HTTPException, status
@@ -9,7 +9,6 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 import httpx
-import requests
 import yt_dlp
 
 # =====================================================================
@@ -146,35 +145,6 @@ def get_common_yt_dlp_opts() -> dict:
 
     return opts
 
-def iterfile(url: str) -> Generator[bytes, None, None]:
-    """Streams video chunks through the proxy with complete browser headers to bypass CDN 403 blocks."""
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
-        "Referer": "https://www.tiktok.com/",
-        "Accept": "*/*",
-        "Accept-Encoding": "identity",
-        "Range": "bytes=0-",
-    }
-    
-    proxies = None
-    if DATAIMPULSE_PROXY and DATAIMPULSE_PROXY.strip():
-        p_str = DATAIMPULSE_PROXY.strip()
-        if p_str.startswith("https://"):
-            p_str = "http://" + p_str[8:]
-        elif not p_str.startswith("http://"):
-            p_str = "http://" + p_str
-        
-        proxies = {
-            "http": p_str,
-            "https": p_str
-        }
-
-    with requests.get(url, headers=headers, proxies=proxies, stream=True, timeout=30) as r:
-        r.raise_for_status()
-        for chunk in r.iter_content(chunk_size=128 * 1024):
-            if chunk:
-                yield chunk
-
 # =====================================================================
 # SYNCHRONOUS EXTRACTORS
 # =====================================================================
@@ -258,21 +228,39 @@ async def health_check():
 
 @app.get("/api/proxy-download")
 async def proxy_download(url: str):
-    """Streams the raw video bytes through Render to bypass TikTok's 403 IP lock."""
-    try:
-        return StreamingResponse(
-            iterfile(url),
-            media_type="video/mp4",
-            headers={
-                "Content-Disposition": 'attachment; filename="tiktok_video.mp4"',
-                "Content-Type": "video/mp4"
-            }
-        )
-    except Exception as e:
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Stream error: {str(e)}"
-        )
+    """Streams the raw video bytes asynchronously to avoid blocking the Uvicorn worker thread."""
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
+        "Referer": "https://www.tiktok.com/",
+        "Accept": "*/*",
+        "Accept-Encoding": "identity",
+    }
+    
+    proxy_config = None
+    if DATAIMPULSE_PROXY and DATAIMPULSE_PROXY.strip():
+        p_str = DATAIMPULSE_PROXY.strip()
+        if p_str.startswith("https://"):
+            p_str = "http://" + p_str[8:]
+        elif not p_str.startswith("http://"):
+            p_str = "http://" + p_str
+        proxy_config = p_str
+
+    async def stream_chunks():
+        async with httpx.AsyncClient(proxy=proxy_config, follow_redirects=True, timeout=60.0) as client:
+            async with client.stream("GET", url, headers=headers) as response:
+                if response.status_code not in (200, 206):
+                    raise HTTPException(status_code=400, detail="Failed to stream video stream from CDN.")
+                async for chunk in response.aiter_bytes(chunk_size=128 * 1024):
+                    yield chunk
+
+    return StreamingResponse(
+        stream_chunks(),
+        media_type="video/mp4",
+        headers={
+            "Content-Disposition": 'attachment; filename="tiktok_video.mp4"',
+            "Content-Type": "video/mp4",
+        }
+    )
 
 @app.post("/api/download-single", response_model=SingleVideoResponse)
 async def api_download_single(payload: SingleVideoRequest):
