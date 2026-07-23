@@ -5,7 +5,7 @@ lucide.createIcons();
 // In production, change this to your actual backend domain (e.g., https://api.savetokhd.com/api)
 const API_BASE_URL = window.location.hostname === 'localhost' || window.location.hostname === '127.0.0.1' 
     ? "http://127.0.0.1:8000/api" 
-    :  "https://savetokhd-app.onrender.com/api";
+    : "https://savetokhd-app.onrender.com/api";
 
 // Health Check on Load
 async function checkBackendHealth() {
@@ -18,7 +18,6 @@ async function checkBackendHealth() {
     }
 }
 checkBackendHealth();
-
 
 // State management for bulk data
 let currentBulkData = null;
@@ -52,6 +51,46 @@ function escapeHTML(str) {
     const div = document.createElement('div');
     div.textContent = str;
     return div.innerHTML;
+}
+
+// --- Background File Streamer (Prevents Redirection) ---
+
+/**
+ * Streams the video as a blob in the background and triggers save-dialog on savetokhd.com
+ * @param {string} proxiedUrl 
+ * @param {HTMLElement} buttonElement 
+ */
+async function downloadVideoFile(proxiedUrl, buttonElement) {
+    const originalHTML = buttonElement.innerHTML;
+    
+    try {
+        buttonElement.disabled = true;
+        buttonElement.innerHTML = `<i data-lucide="loader-2" class="w-5 h-5 animate-spin"></i> Downloading...`;
+        lucide.createIcons();
+
+        const response = await fetch(proxiedUrl);
+        if (!response.ok) throw new Error("Stream error from server.");
+
+        const blob = await response.blob();
+        const tempUrl = window.URL.createObjectURL(blob);
+
+        const a = document.createElement("a");
+        a.style.display = "none";
+        a.href = tempUrl;
+        a.download = `tiktok_video_${new Date().getTime()}.mp4`;
+        document.body.appendChild(a);
+        a.click();
+
+        window.URL.revokeObjectURL(tempUrl);
+        document.body.removeChild(a);
+    } catch (err) {
+        alert("Download failed. Please try again.");
+        console.error("File download error:", err);
+    } finally {
+        buttonElement.disabled = false;
+        buttonElement.innerHTML = originalHTML;
+        lucide.createIcons();
+    }
 }
 
 // --- UI Logic ---
@@ -96,7 +135,7 @@ function clearUI() {
     elements.errorBox.classList.add('hidden');
     elements.results.classList.add('hidden');
     elements.results.innerHTML = '';
-    currentBulkData = null; // Clear state
+    currentBulkData = null;
 }
 
 function toggleFaq(button) {
@@ -138,7 +177,6 @@ async function handleSingleDownload() {
 
 function renderSingleResult(data) {
     elements.results.classList.remove('hidden');
-    // Use escapeHTML for all dynamic content
     elements.results.innerHTML = `
         <div class="bg-gray-900 border border-gray-700 rounded-xl overflow-hidden flex flex-col md:flex-row">
             <div class="md:w-1/3 relative group">
@@ -156,14 +194,20 @@ function renderSingleResult(data) {
                     </div>
                 </div>
                 <div class="space-y-3">
-                    <a href="${escapeHTML(data.download_url)}" target="_blank" class="w-full bg-green-600 hover:bg-green-700 py-3 rounded-lg font-bold text-center block transition flex items-center justify-center gap-2">
+                    <button id="btn-download-media" data-url="${escapeHTML(data.download_url)}" class="w-full bg-green-600 hover:bg-green-700 py-3 rounded-lg font-bold text-center block transition flex items-center justify-center gap-2">
                         <i data-lucide="download"></i> Download No-Watermark MP4
-                    </a>
+                    </button>
                 </div>
             </div>
         </div>
     `;
     lucide.createIcons();
+
+    // Attach click listener for background file streaming
+    document.getElementById('btn-download-media').addEventListener('click', function() {
+        const downloadUrl = this.getAttribute('data-url');
+        downloadVideoFile(downloadUrl, this);
+    });
 }
 
 async function handleBulkExtract() {
@@ -188,7 +232,7 @@ async function handleBulkExtract() {
         }
         
         const data = await response.json();
-        currentBulkData = data; // Store in state for CSV export
+        currentBulkData = data;
         renderBulkResult(data);
     } catch (err) {
         showError(err.message || "Failed to extract profile. Ensure the account is public.");
@@ -229,7 +273,7 @@ function renderBulkResult(data) {
                                 <td class="p-4 text-gray-400">${escapeHTML(v.duration)}</td>
                                 <td class="p-4 text-right">
                                     <a href="${escapeHTML(v.url)}" target="_blank" class="text-red-500 hover:text-red-400 font-bold inline-flex items-center gap-1">
-                                        <i data-lucide="download" class="w-4 h-4"></i> Save
+                                        <i data-lucide="external-link" class="w-4 h-4"></i> View
                                     </a>
                                 </td>
                             </tr>
@@ -241,7 +285,6 @@ function renderBulkResult(data) {
     `;
     lucide.createIcons();
     
-    // Attach dynamic export listener
     document.getElementById('btn-export').addEventListener('click', exportToCSV);
 }
 
@@ -250,11 +293,10 @@ function renderBulkResult(data) {
 function exportToCSV() {
     if (!currentBulkData || !currentBulkData.videos.length) return;
 
-    const headers = ["Caption", "Views", "Duration", "Download URL"];
+    const headers = ["Caption", "Views", "Duration", "TikTok URL"];
     
-    // Process rows and handle quotes for CSV compatibility
     const rows = currentBulkData.videos.map(v => [
-        `"${v.caption.replace(/"/g, '""')}"`, // Escape double quotes
+        `"${v.caption.replace(/"/g, '""')}"`,
         `"${v.views}"`,
         `"${v.duration}"`,
         `"${v.url}"`
@@ -277,6 +319,9 @@ function exportToCSV() {
 }
 
 // --- Event Listeners ---
+
+if (elements.tabSingle) elements.tabSingle.addEventListener('click', () => switchTab('single'));
+if (elements.tabBulk) elements.tabBulk.addEventListener('click', () => switchTab('bulk'));
 
 elements.btnSingle.addEventListener('click', handleSingleDownload);
 elements.btnBulk.addEventListener('click', handleBulkExtract);
