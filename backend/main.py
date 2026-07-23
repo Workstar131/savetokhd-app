@@ -205,9 +205,14 @@ def _sync_extract_bulk(username: str) -> dict:
 # API ENDPOINTS
 # =====================================================================
 
+
 @app.get("/api/health")
 async def health_check():
-    return {"status": "online", "domain": "savetokhd.com"}
+    return {
+        "status": "online",
+        "domain": "savetokhd.com",
+        "yt_dlp_version": yt_dlp.version.__version__
+    }
 
 @app.post("/api/download-single", response_model=SingleVideoResponse)
 async def api_download_single(payload: SingleVideoRequest):
