@@ -73,24 +73,24 @@ class BulkExtractResponse(BaseModel):
 # =====================================================================
 
 def clean_tiktok_url(text: str) -> str:
-    """Extracts valid HTTP/HTTPS URL and unspools short links (vm.tiktok.com / vt.tiktok.com)."""
+    """Extracts valid HTTP/HTTPS URL and unspools short links using GET requests."""
     match = re.search(r'https?://[^\s]+', text)
     if not match:
         return text.strip()
 
     url = match.group(0)
 
-    # Unroll short links using real browser headers before passing to yt-dlp
+    # TikTok blocks HEAD requests; use GET with mobile headers to unroll redirects
     if "vm.tiktok.com" in url or "vt.tiktok.com" in url:
         try:
             headers = {
-                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+                "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 16_6 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.6 Mobile/15E148 Safari/604.1"
             }
             with httpx.Client(follow_redirects=True, timeout=10.0, headers=headers) as client:
-                response = client.head(url)
-                url = str(response.url)
+                res = client.get(url)
+                url = str(res.url)
         except Exception:
-            pass  # Fall back to original link if request times out
+            pass
 
     return url
 
@@ -112,15 +112,22 @@ def format_duration(seconds: Optional[float]) -> str:
     return f"{mins:02d}:{secs:02d}"
 
 def get_common_yt_dlp_opts() -> dict:
-    """Base options with proxy rotation and browser headers configured."""
+    """Base options simulating modern mobile browsers."""
     opts = {
         'quiet': True,
         'no_warnings': True,
         'ignoreerrors': True,
         'socket_timeout': 15,
+        'extractor_args': {
+            'tiktok': {
+                'app_version': '32.5.3',
+                'manifest_app_version': '32.5.3',
+            }
+        },
         'http_headers': {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-            'Accept-Language': 'en-US,en;q=0.9',
+            'User-Agent': 'Mozilla/5.0 (iPhone; CPU iPhone OS 16_6 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.6 Mobile/15E148 Safari/604.1',
+            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+            'Accept-Language': 'en-US,en;q=0.5',
         }
     }
     if DATAIMPULSE_PROXY:
