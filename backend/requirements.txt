@@ -1,5 +1,6 @@
 fastapi
 uvicorn
 pydantic
-yt-dlp
 httpx
+requests
+yt-dlp
