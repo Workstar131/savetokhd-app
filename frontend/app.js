@@ -5,7 +5,7 @@ lucide.createIcons();
 // In production, change this to your actual backend domain (e.g., https://api.savetokhd.com/api)
 const API_BASE_URL = window.location.hostname === 'localhost' || window.location.hostname === '127.0.0.1' 
     ? "http://127.0.0.1:8000/api" 
-    : "https://api.savetokhd.com/api"; 
+    :  "https://savetokhd-app.onrender.com/api";
 
 // Health Check on Load
 async function checkBackendHealth() {
