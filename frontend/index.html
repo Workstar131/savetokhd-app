@@ -1,0 +1,373 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>TikTok Downloader & Bulk Profile Extractor | No Watermark HD</title>
+    <meta name="description" content="Free online TikTok downloader. Download single videos or bulk extract entire profiles without watermark in HD. Fast, secure, and unlimited.">
+    <meta name="keywords" content="tiktok downloader, tiktok bulk downloader, download tiktok without watermark, tiktok video extractor, export tiktok to csv">
+    
+    <!-- Tailwind CSS CDN -->
+    <script src="https://cdn.tailwindcss.com"></script>
+    <!-- Lucide Icons -->
+    <script src="https://unpkg.com/lucide@latest"></script>
+    
+    <style>
+        /* Custom scrollbar and smooth scroll */
+        html { scroll-behavior: smooth; }
+        ::-webkit-scrollbar { width: 8px; }
+        ::-webkit-scrollbar-track { background: #111827; }
+        ::-webkit-scrollbar-thumb { background: #374151; border-radius: 4px; }
+        ::-webkit-scrollbar-thumb:hover { background: #4b5563; }
+        
+        .tab-active { border-bottom: 3px solid #ef4444; color: #ef4444; }
+        .accordion-content { max-height: 0; overflow: hidden; transition: max-height 0.5s cubic-bezier(0, 1, 0, 1); }
+        .accordion-active .accordion-content { max-height: 1000px; transition: max-height 1s ease-in; }
+        .accordion-active .chevron { transform: rotate(180deg); }
+        
+        /* Loading animation refinement */
+        @keyframes pulse-red {
+            0%, 100% { opacity: 1; }
+            50% { opacity: .5; }
+        }
+        .animate-pulse-red { animation: pulse-red 2s cubic-bezier(0.4, 0, 0.6, 1) infinite; }
+    </style>
+    
+    <!-- FAQ Schema for SEO -->
+    <script type="application/ld+json">
+    {
+      "@context": "https://schema.org",
+      "@type": "FAQPage",
+      "mainEntity": [{
+        "@type": "Question",
+        "name": "Is this TikTok downloader free?",
+        "acceptedAnswer": {
+          "@type": "Answer",
+          "text": "Yes, TikTokExtract is 100% free to use. We don't charge any fees, and you don't need to create an account to download videos."
+        }
+      }, {
+        "@type": "Question",
+        "name": "Does it remove the TikTok logo watermark?",
+        "acceptedAnswer": {
+          "@type": "Answer",
+          "text": "Absolutely! Our tool extracts the original high-definition video file directly from TikTok's servers without any watermark or logo."
+        }
+      }, {
+        "@type": "Question",
+        "name": "Can I download all videos from a profile at once?",
+        "acceptedAnswer": {
+          "@type": "Answer",
+          "text": "Yes, our Bulk Profile Extractor allows you to enter a username and fetch metadata for all public videos on that profile, which you can then export to CSV."
+        }
+      }]
+    }
+    </script>
+</head>
+<body class="bg-gray-900 text-gray-100 font-sans antialiased">
+
+    <!-- Navigation Bar -->
+    <header class="sticky top-0 z-50 bg-gray-900/80 backdrop-blur-md border-b border-gray-800">
+        <div class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8">
+            <div class="flex justify-between items-center h-16">
+                <div class="flex items-center gap-2">
+                    <i data-lucide="video" class="text-red-500 w-8 h-8"></i>
+                    <span class="text-xl font-bold tracking-tight">TikTok<span class="text-red-500">Extract</span></span>
+                </div>
+                <nav class="hidden md:flex space-x-8">
+                    <a href="#tool" class="text-gray-300 hover:text-white transition">Tool</a>
+                    <a href="#features" class="text-gray-300 hover:text-white transition">Features</a>
+                    <a href="#how-it-works" class="text-gray-300 hover:text-white transition">How It Works</a>
+                    <a href="#faq" class="text-gray-300 hover:text-white transition">FAQ</a>
+                </nav>
+                <div>
+                    <a href="#tool" onclick="switchTab('bulk')" class="bg-red-600 hover:bg-red-700 text-white px-5 py-2 rounded-full font-medium transition shadow-lg shadow-red-600/20">
+                        Bulk Downloader
+                    </a>
+                </div>
+            </div>
+        </div>
+    </header>
+
+    <main>
+        <!-- Hero Section & Tool Engine -->
+        <section id="tool" class="py-16 md:py-24 px-4 bg-gradient-to-b from-gray-900 to-gray-800">
+            <div class="max-w-4xl mx-auto text-center">
+                <h1 class="text-4xl md:text-6xl font-extrabold mb-6 bg-clip-text text-transparent bg-gradient-to-r from-white to-gray-400">
+                    Free TikTok Downloader & Bulk Profile Extractor
+                </h1>
+                <p class="text-lg md:text-xl text-gray-400 mb-10">
+                    Fast, free, and unlimited HD TikTok video downloader. Download single videos or export entire profile catalogs in seconds.
+                </p>
+
+                <!-- Tool Container -->
+                <div class="bg-gray-800 border border-gray-700 rounded-2xl shadow-2xl overflow-hidden">
+                    <!-- Tab Switcher -->
+                    <div class="flex border-b border-gray-700">
+                        <button id="tab-single" onclick="switchTab('single')" class="flex-1 py-4 font-semibold text-lg transition tab-active">
+                            Single Video
+                        </button>
+                        <button id="tab-bulk" onclick="switchTab('bulk')" class="flex-1 py-4 font-semibold text-lg text-gray-400 transition">
+                            Bulk Profile
+                        </button>
+                    </div>
+
+                    <div class="p-6 md:p-10">
+                        <!-- Single Downloader Form -->
+                        <div id="form-single" class="space-y-4">
+                            <div class="relative">
+                                <i data-lucide="link" class="absolute left-4 top-1/2 -translate-y-1/2 text-gray-500 w-5 h-5"></i>
+                                <input type="text" id="input-single" placeholder="Paste TikTok video link here..." 
+                                    class="w-full bg-gray-900 border border-gray-700 rounded-xl py-4 pl-12 pr-4 focus:ring-2 focus:ring-red-500 focus:border-transparent outline-none transition">
+                            </div>
+                            <button id="btn-single" class="w-full bg-red-600 hover:bg-red-700 py-4 rounded-xl font-bold text-lg transition flex items-center justify-center gap-2">
+                                <i data-lucide="download"></i> Download HD Video
+                            </button>
+                        </div>
+
+                        <!-- Bulk Downloader Form (Hidden by default) -->
+                        <div id="form-bulk" class="hidden space-y-4">
+                            <div class="relative">
+                                <i data-lucide="user" class="absolute left-4 top-1/2 -translate-y-1/2 text-gray-500 w-5 h-5"></i>
+                                <input type="text" id="input-bulk" placeholder="Enter Profile URL or @username..." 
+                                    class="w-full bg-gray-900 border border-gray-700 rounded-xl py-4 pl-12 pr-4 focus:ring-2 focus:ring-red-500 focus:border-transparent outline-none transition">
+                            </div>
+                            <button id="btn-bulk" class="w-full bg-red-600 hover:bg-red-700 py-4 rounded-xl font-bold text-lg transition flex items-center justify-center gap-2">
+                                <i data-lucide="layers"></i> Extract All Videos
+                            </button>
+                        </div>
+
+                        <!-- Loading State -->
+                        <div id="loading" class="hidden py-8 text-center">
+                            <div class="inline-block animate-spin rounded-full h-12 w-12 border-4 border-red-500 border-t-transparent mb-4"></div>
+                            <p id="loading-msg" class="text-gray-400 italic">Connecting to TikTok server...</p>
+                        </div>
+
+                        <!-- Error State -->
+                        <div id="error-box" class="hidden mt-6 p-4 bg-red-900/30 border border-red-500/50 rounded-xl text-red-200 flex items-center gap-3">
+                            <i data-lucide="alert-circle"></i>
+                            <span id="error-msg">Invalid URL or server limit reached.</span>
+                        </div>
+
+                        <!-- Results Container -->
+                        <div id="results" class="hidden mt-8 text-left">
+                            <!-- Results will be injected here by app.js -->
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </section>
+
+        <!-- Ad Slot #1 -->
+        <section class="max-w-7xl mx-auto px-4 py-8">
+            <div class="bg-gray-800/50 border border-dashed border-gray-700 rounded-lg p-4 flex flex-col items-center justify-center min-h-[120px]">
+                <span class="text-xs text-gray-500 uppercase tracking-widest mb-2">Advertisement</span>
+                <!-- Adsterra 728x90 / 320x50 Placeholder -->
+                <div id="ad-slot-1" class="w-full flex justify-center">
+                    <div class="hidden md:block bg-gray-700 w-[728px] h-[90px] animate-pulse rounded"></div>
+                    <div class="md:hidden bg-gray-700 w-[320px] h-[50px] animate-pulse rounded"></div>
+                </div>
+            </div>
+        </section>
+
+        <!-- How It Works Section -->
+        <section id="how-it-works" class="py-20 px-4">
+            <div class="max-w-7xl mx-auto text-center">
+                <h2 class="text-3xl md:text-4xl font-bold mb-16">How It Works</h2>
+                <div class="grid md:grid-cols-3 gap-12">
+                    <div class="flex flex-col items-center">
+                        <div class="w-16 h-16 bg-red-600/20 text-red-500 rounded-full flex items-center justify-center mb-6">
+                            <i data-lucide="copy" class="w-8 h-8"></i>
+                        </div>
+                        <h3 class="text-xl font-bold mb-3">1. Copy Link</h3>
+                        <p class="text-gray-400">Copy the TikTok video URL or the profile username you want to extract.</p>
+                    </div>
+                    <div class="flex flex-col items-center">
+                        <div class="w-16 h-16 bg-red-600/20 text-red-500 rounded-full flex items-center justify-center mb-6">
+                            <i data-lucide="mouse-pointer-2" class="w-8 h-8"></i>
+                        </div>
+                        <h3 class="text-xl font-bold mb-3">2. Paste & Submit</h3>
+                        <p class="text-gray-400">Paste it into our free online tool input box above and hit the button.</p>
+                    </div>
+                    <div class="flex flex-col items-center">
+                        <div class="w-16 h-16 bg-red-600/20 text-red-500 rounded-full flex items-center justify-center mb-6">
+                            <i data-lucide="file-check" class="w-8 h-8"></i>
+                        </div>
+                        <h3 class="text-xl font-bold mb-3">3. Save / Export</h3>
+                        <p class="text-gray-400">Download watermark-free MP4 or export all video links to a CSV file.</p>
+                    </div>
+                </div>
+            </div>
+        </section>
+
+        <!-- Key Features Section -->
+        <section id="features" class="py-20 px-4 bg-gray-800/30">
+            <div class="max-w-7xl mx-auto">
+                <h2 class="text-3xl md:text-4xl font-bold text-center mb-16">Why Use TikTokExtract?</h2>
+                <div class="grid md:grid-cols-2 lg:grid-cols-3 gap-8">
+                    <div class="p-8 bg-gray-800 border border-gray-700 rounded-2xl hover:border-red-500/50 transition group">
+                        <i data-lucide="zap" class="text-red-500 mb-4 w-10 h-10"></i>
+                        <h3 class="text-xl font-bold mb-2">Ultra-Fast Processing</h3>
+                        <p class="text-gray-400">Our high-performance servers process your requests in under 2 seconds.</p>
+                    </div>
+                    <div class="p-8 bg-gray-800 border border-gray-700 rounded-2xl hover:border-red-500/50 transition group">
+                        <i data-lucide="shield-check" class="text-red-500 mb-4 w-10 h-10"></i>
+                        <h3 class="text-xl font-bold mb-2">No Watermark</h3>
+                        <p class="text-gray-400">Get clean, original quality HD videos without any TikTok logos or watermarks.</p>
+                    </div>
+                    <div class="p-8 bg-gray-800 border border-gray-700 rounded-2xl hover:border-red-500/50 transition group">
+                        <i data-lucide="database" class="text-red-500 mb-4 w-10 h-10"></i>
+                        <h3 class="text-xl font-bold mb-2">Bulk CSV Export</h3>
+                        <p class="text-gray-400">Perfect for creators and researchers—export entire profile metadata to CSV.</p>
+                    </div>
+                    <div class="p-8 bg-gray-800 border border-gray-700 rounded-2xl hover:border-red-500/50 transition group">
+                        <i data-lucide="smartphone" class="text-red-500 mb-4 w-10 h-10"></i>
+                        <h3 class="text-xl font-bold mb-2">100% Mobile Compatible</h3>
+                        <p class="text-gray-400">Works perfectly on iPhones, Android, and tablets without installing any apps.</p>
+                    </div>
+                    <div class="p-8 bg-gray-800 border border-gray-700 rounded-2xl hover:border-red-500/50 transition group">
+                        <i data-lucide="lock" class="text-red-500 mb-4 w-10 h-10"></i>
+                        <h3 class="text-xl font-bold mb-2">Safe & Secure</h3>
+                        <p class="text-gray-400">We don't require your TikTok login or store your personal data.</p>
+                    </div>
+                    <div class="p-8 bg-gray-800 border border-gray-700 rounded-2xl hover:border-red-500/50 transition group">
+                        <i data-lucide="infinity" class="text-red-500 mb-4 w-10 h-10"></i>
+                        <h3 class="text-xl font-bold mb-2">Unlimited Downloads</h3>
+                        <p class="text-gray-400">No daily limits or hidden costs. Download as much as you need for free.</p>
+                    </div>
+                </div>
+            </div>
+        </section>
+
+        <!-- Ad Slot #2 -->
+        <section class="max-w-7xl mx-auto px-4 py-12">
+            <div class="bg-gray-800/50 border border-dashed border-gray-700 rounded-lg p-6 flex flex-col items-center justify-center min-h-[250px]">
+                <span class="text-xs text-gray-500 uppercase tracking-widest mb-4">Recommended For You</span>
+                <!-- Adsterra Native Ad Placeholder -->
+                <div id="ad-slot-2" class="w-full grid grid-cols-1 md:grid-cols-3 gap-4">
+                    <div class="bg-gray-700 h-40 animate-pulse rounded-xl"></div>
+                    <div class="bg-gray-700 h-40 animate-pulse rounded-xl hidden md:block"></div>
+                    <div class="bg-gray-700 h-40 animate-pulse rounded-xl hidden md:block"></div>
+                </div>
+            </div>
+        </section>
+
+        <!-- FAQ Section -->
+        <section id="faq" class="py-20 px-4">
+            <div class="max-w-3xl mx-auto">
+                <h2 class="text-3xl md:text-4xl font-bold text-center mb-12">Frequently Asked Questions</h2>
+                <div class="space-y-4">
+                    <!-- FAQ 1 -->
+                    <div class="faq-item border border-gray-700 rounded-xl overflow-hidden">
+                        <button onclick="toggleFaq(this)" class="w-full flex justify-between items-center p-5 bg-gray-800 hover:bg-gray-700 transition">
+                            <span class="font-semibold text-left">Is this TikTok downloader free?</span>
+                            <i data-lucide="chevron-down" class="chevron transition duration-300"></i>
+                        </button>
+                        <div class="accordion-content bg-gray-900/50">
+                            <div class="p-5 text-gray-400">
+                                Yes, TikTokExtract is 100% free to use. We don't charge any fees, and you don't need to create an account to download videos.
+                            </div>
+                        </div>
+                    </div>
+                    <!-- FAQ 2 -->
+                    <div class="faq-item border border-gray-700 rounded-xl overflow-hidden">
+                        <button onclick="toggleFaq(this)" class="w-full flex justify-between items-center p-5 bg-gray-800 hover:bg-gray-700 transition">
+                            <span class="font-semibold text-left">Does it remove the TikTok logo watermark?</span>
+                            <i data-lucide="chevron-down" class="chevron transition duration-300"></i>
+                        </button>
+                        <div class="accordion-content bg-gray-900/50">
+                            <div class="p-5 text-gray-400">
+                                Absolutely! Our tool extracts the original high-definition video file directly from TikTok's servers without any watermark or logo.
+                            </div>
+                        </div>
+                    </div>
+                    <!-- FAQ 3 -->
+                    <div class="faq-item border border-gray-700 rounded-xl overflow-hidden">
+                        <button onclick="toggleFaq(this)" class="w-full flex justify-between items-center p-5 bg-gray-800 hover:bg-gray-700 transition">
+                            <span class="font-semibold text-left">Can I download all videos from a profile at once?</span>
+                            <i data-lucide="chevron-down" class="chevron transition duration-300"></i>
+                        </button>
+                        <div class="accordion-content bg-gray-900/50">
+                            <div class="p-5 text-gray-400">
+                                Yes, our Bulk Profile Extractor allows you to enter a username and fetch metadata for all public videos on that profile, which you can then export to CSV.
+                            </div>
+                        </div>
+                    </div>
+                    <!-- FAQ 4 -->
+                    <div class="faq-item border border-gray-700 rounded-xl overflow-hidden">
+                        <button onclick="toggleFaq(this)" class="w-full flex justify-between items-center p-5 bg-gray-800 hover:bg-gray-700 transition">
+                            <span class="font-semibold text-left">Where are downloaded videos saved?</span>
+                            <i data-lucide="chevron-down" class="chevron transition duration-300"></i>
+                        </button>
+                        <div class="accordion-content bg-gray-900/50">
+                            <div class="p-5 text-gray-400">
+                                On PC, they are usually in your "Downloads" folder. On Android/iPhone, they are saved to your gallery or files app depending on your browser settings.
+                            </div>
+                        </div>
+                    </div>
+                    <!-- FAQ 5 -->
+                    <div class="faq-item border border-gray-700 rounded-xl overflow-hidden">
+                        <button onclick="toggleFaq(this)" class="w-full flex justify-between items-center p-5 bg-gray-800 hover:bg-gray-700 transition">
+                            <span class="font-semibold text-left">Do I need to install software?</span>
+                            <i data-lucide="chevron-down" class="chevron transition duration-300"></i>
+                        </button>
+                        <div class="accordion-content bg-gray-900/50">
+                            <div class="p-5 text-gray-400">
+                                No installation required. Our tool is web-based and works directly in any modern browser like Chrome, Safari, or Firefox.
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </section>
+    </main>
+
+    <!-- Footer -->
+    <footer class="bg-gray-950 border-t border-gray-800 py-12 px-4">
+        <div class="max-w-7xl mx-auto">
+            <div class="grid md:grid-cols-4 gap-12 mb-12">
+                <div class="col-span-1 md:col-span-2">
+                    <div class="flex items-center gap-2 mb-6">
+                        <i data-lucide="video" class="text-red-500 w-6 h-6"></i>
+                        <span class="text-xl font-bold tracking-tight">TikTok<span class="text-red-500">Extract</span></span>
+                    </div>
+                    <p class="text-gray-500 max-w-sm">
+                        The ultimate tool for TikTok content creators and researchers. Download HD videos without watermarks and export bulk profile data easily.
+                    </p>
+                </div>
+                <div>
+                    <h4 class="font-bold mb-6">Quick Links</h4>
+                    <ul class="space-y-4 text-gray-500">
+                        <li><a href="#tool" class="hover:text-red-500 transition">Downloader</a></li>
+                        <li><a href="#features" class="hover:text-red-500 transition">Features</a></li>
+                        <li><a href="#how-it-works" class="hover:text-red-500 transition">How It Works</a></li>
+                        <li><a href="#faq" class="hover:text-red-500 transition">FAQ</a></li>
+                    </ul>
+                </div>
+                <div>
+                    <h4 class="font-bold mb-6">Legal</h4>
+                    <ul class="space-y-4 text-gray-500">
+                        <li><a href="#" class="hover:text-red-500 transition">Terms of Service</a></li>
+                        <li><a href="#" class="hover:text-red-500 transition">Privacy Policy</a></li>
+                        <li><a href="#" class="hover:text-red-500 transition">DMCA Disclaimer</a></li>
+                        <li><a href="#" class="hover:text-red-500 transition">Contact Us</a></li>
+                    </ul>
+                </div>
+            </div>
+            <div class="border-t border-gray-900 pt-8 flex flex-col md:row justify-between items-center gap-4">
+                <p class="text-gray-600 text-sm">
+                    &copy; 2026 TikTokExtract. All rights reserved.
+                </p>
+                <div class="flex gap-6">
+                    <a href="#" class="text-gray-600 hover:text-white"><i data-lucide="twitter" class="w-5 h-5"></i></a>
+                    <a href="#" class="text-gray-600 hover:text-white"><i data-lucide="github" class="w-5 h-5"></i></a>
+                </div>
+            </div>
+        </div>
+    </footer>
+
+    <!-- Scripts -->
+    <script src="app.js"></script>
+    <!-- Adsterra Popunder Placeholder -->
+    <!-- <script type='text/javascript' src='//pl12345678.highperformanceformat.com/...'></script> -->
+</body>
+</html>
