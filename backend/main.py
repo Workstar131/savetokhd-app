@@ -2,8 +2,11 @@ import asyncio
 import os
 import re
 from typing import Optional, List
+from urllib.parse import quote
+
 from fastapi import FastAPI, HTTPException, status
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 import httpx
 import yt_dlp
@@ -125,9 +128,17 @@ def get_common_yt_dlp_opts() -> dict:
         }
     }
     
-    # Check for non-empty string to avoid empty-proxy urllib error
+    # Check if PROXY_URL is populated
     if DATAIMPULSE_PROXY and DATAIMPULSE_PROXY.strip():
-        opts['proxy'] = DATAIMPULSE_PROXY.strip()
+        proxy_str = DATAIMPULSE_PROXY.strip()
+        
+        # yt-dlp urllib does NOT support https:// proxy protocols.
+        if proxy_str.startswith("https://"):
+            proxy_str = "http://" + proxy_str[8:]
+        elif not proxy_str.startswith("http://"):
+            proxy_str = "http://" + proxy_str
+
+        opts['proxy'] = proxy_str
 
     return opts
 
@@ -146,16 +157,19 @@ def _sync_download_single(video_url: str) -> dict:
         if not info:
             raise ValueError("TikTok blocked metadata extraction for this link.")
 
-        download_url = info.get('url')
-        if not download_url and 'requested_formats' in info:
-            download_url = info['requested_formats'][0].get('url')
+        raw_download_url = info.get('url')
+        if not raw_download_url and 'requested_formats' in info:
+            raw_download_url = info['requested_formats'][0].get('url')
+
+        # Wrap raw URL into backend proxy endpoint to prevent 403 IP lockouts
+        proxied_url = f"https://savetokhd-app.onrender.com/api/proxy-download?url={quote(raw_download_url or video_url)}"
 
         return {
             "title": info.get('title', 'TikTok Video'),
             "author": f"@{info.get('uploader_id', info.get('uploader', 'creator'))}",
             "views": format_count(info.get('view_count')),
             "thumbnail": info.get('thumbnail', ''),
-            "download_url": download_url or video_url
+            "download_url": proxied_url
         }
 
 def _sync_extract_bulk(username: str) -> dict:
@@ -209,6 +223,28 @@ async def health_check():
         "domain": "savetokhd.com", 
         "yt_dlp_version": yt_dlp.version.__version__
     }
+
+@app.get("/api/proxy-download")
+async def proxy_download(url: str):
+    """Streams the raw video bytes through Render to bypass TikTok's 403 IP lock."""
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
+        "Referer": "https://www.tiktok.com/",
+    }
+    
+    async def stream_video():
+        async with httpx.AsyncClient(follow_redirects=True, timeout=30.0) as client:
+            async with client.stream("GET", url, headers=headers) as response:
+                if response.status_code != 200:
+                    raise HTTPException(status_code=400, detail="Failed to stream video from TikTok.")
+                async for chunk in response.aiter_bytes(chunk_size=1024 * 64):
+                    yield chunk
+
+    return StreamingResponse(
+        stream_video(),
+        media_type="video/mp4",
+        headers={"Content-Disposition": "attachment; filename=tiktok_video.mp4"}
+    )
 
 @app.post("/api/download-single", response_model=SingleVideoResponse)
 async def api_download_single(payload: SingleVideoRequest):
