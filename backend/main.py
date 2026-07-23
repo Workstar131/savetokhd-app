@@ -5,6 +5,7 @@ from typing import Optional, List
 from fastapi import FastAPI, HTTPException, status
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
+import httpx
 import yt_dlp
 
 # =====================================================================
@@ -72,11 +73,26 @@ class BulkExtractResponse(BaseModel):
 # =====================================================================
 
 def clean_tiktok_url(text: str) -> str:
-    """Extracts the first valid HTTP/HTTPS URL from user input, removing app share clutter."""
+    """Extracts valid HTTP/HTTPS URL and unspools short links (vm.tiktok.com / vt.tiktok.com)."""
     match = re.search(r'https?://[^\s]+', text)
-    if match:
-        return match.group(0)
-    return text.strip()
+    if not match:
+        return text.strip()
+
+    url = match.group(0)
+
+    # Unroll short links using real browser headers before passing to yt-dlp
+    if "vm.tiktok.com" in url or "vt.tiktok.com" in url:
+        try:
+            headers = {
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+            }
+            with httpx.Client(follow_redirects=True, timeout=10.0, headers=headers) as client:
+                response = client.head(url)
+                url = str(response.url)
+        except Exception:
+            pass  # Fall back to original link if request times out
+
+    return url
 
 def format_count(count: Optional[int]) -> str:
     """Format view counts into readable K/M strings."""
@@ -96,12 +112,16 @@ def format_duration(seconds: Optional[float]) -> str:
     return f"{mins:02d}:{secs:02d}"
 
 def get_common_yt_dlp_opts() -> dict:
-    """Base options with proxy rotation configured."""
+    """Base options with proxy rotation and browser headers configured."""
     opts = {
         'quiet': True,
         'no_warnings': True,
         'ignoreerrors': True,
         'socket_timeout': 15,
+        'http_headers': {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+            'Accept-Language': 'en-US,en;q=0.9',
+        }
     }
     if DATAIMPULSE_PROXY:
         opts['proxy'] = DATAIMPULSE_PROXY
@@ -184,7 +204,7 @@ async def health_check():
 
 @app.post("/api/download-single", response_model=SingleVideoResponse)
 async def api_download_single(payload: SingleVideoRequest):
-    # Extract clean URL from messy input
+    # Sanitize text and unroll shortlinks
     sanitized_url = clean_tiktok_url(payload.url)
 
     if "tiktok.com" not in sanitized_url:
