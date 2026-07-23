@@ -1,7 +1,7 @@
 import asyncio
 import os
 import re
-from typing import Optional, List
+from typing import Optional, List, Generator
 from urllib.parse import quote
 
 from fastapi import FastAPI, HTTPException, status
@@ -9,6 +9,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 import httpx
+import requests
 import yt_dlp
 
 # =====================================================================
@@ -142,6 +143,19 @@ def get_common_yt_dlp_opts() -> dict:
 
     return opts
 
+def iterfile(url: str) -> Generator[bytes, None, None]:
+    """Streams video chunks synchronously from TikTok to avoid async socket drops."""
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
+        "Referer": "https://www.tiktok.com/",
+        "Accept": "*/*",
+    }
+    with requests.get(url, headers=headers, stream=True, timeout=30) as r:
+        r.raise_for_status()
+        for chunk in r.iter_content(chunk_size=128 * 1024):
+            if chunk:
+                yield chunk
+
 # =====================================================================
 # SYNCHRONOUS EXTRACTORS
 # =====================================================================
@@ -161,7 +175,7 @@ def _sync_download_single(video_url: str) -> dict:
         if not raw_download_url and 'requested_formats' in info:
             raw_download_url = info['requested_formats'][0].get('url')
 
-        # Wrap raw URL into backend proxy endpoint to prevent 403 IP lockouts
+        # Encode full raw CDN URL for backend proxy stream
         proxied_url = f"https://savetokhd-app.onrender.com/api/proxy-download?url={quote(raw_download_url or video_url)}"
 
         return {
@@ -227,24 +241,20 @@ async def health_check():
 @app.get("/api/proxy-download")
 async def proxy_download(url: str):
     """Streams the raw video bytes through Render to bypass TikTok's 403 IP lock."""
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
-        "Referer": "https://www.tiktok.com/",
-    }
-    
-    async def stream_video():
-        async with httpx.AsyncClient(follow_redirects=True, timeout=30.0) as client:
-            async with client.stream("GET", url, headers=headers) as response:
-                if response.status_code != 200:
-                    raise HTTPException(status_code=400, detail="Failed to stream video from TikTok.")
-                async for chunk in response.aiter_bytes(chunk_size=1024 * 64):
-                    yield chunk
-
-    return StreamingResponse(
-        stream_video(),
-        media_type="video/mp4",
-        headers={"Content-Disposition": "attachment; filename=tiktok_video.mp4"}
-    )
+    try:
+        return StreamingResponse(
+            iterfile(url),
+            media_type="video/mp4",
+            headers={
+                "Content-Disposition": 'attachment; filename="tiktok_video.mp4"',
+                "Content-Type": "video/mp4"
+            }
+        )
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Stream error: {str(e)}"
+        )
 
 @app.post("/api/download-single", response_model=SingleVideoResponse)
 async def api_download_single(payload: SingleVideoRequest):
