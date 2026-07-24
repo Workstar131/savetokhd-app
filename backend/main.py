@@ -219,16 +219,29 @@ async def health_check():
 
 @app.get("/api/proxy-download")
 async def proxy_download(url: str):
-    """Streams raw video bytes from TikTok CDN with clean stream disconnect handling."""
+    """Streams raw video bytes from TikTok CDN with clean stream disconnect handling and proxy support."""
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
         "Referer": "https://www.tiktok.com/",
         "Accept": "*/*",
     }
 
+    # Prepare proxy for httpx
+    proxy_config = None
+    if DATAIMPULSE_PROXY and DATAIMPULSE_PROXY.strip():
+        proxy_url = DATAIMPULSE_PROXY.strip()
+        if not proxy_url.startswith(("http://", "https://")):
+            proxy_url = "http://" + proxy_url
+        proxy_config = proxy_url
+
     async def stream_cdn():
         try:
-            async with httpx.AsyncClient(follow_redirects=True, timeout=30.0) as client:
+            # Use the proxy if configured, otherwise direct connection
+            async with httpx.AsyncClient(
+                follow_redirects=True, 
+                timeout=60.0, 
+                proxy=proxy_config
+            ) as client:
                 async with client.stream("GET", url, headers=headers) as response:
                     if response.status_code not in (200, 206):
                         return
