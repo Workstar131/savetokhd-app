@@ -125,7 +125,6 @@ def get_common_yt_dlp_opts() -> dict:
             'Sec-Fetch-Mode': 'navigate',
         }
     }
-    
     if DATAIMPULSE_PROXY and DATAIMPULSE_PROXY.strip():
         proxy_str = DATAIMPULSE_PROXY.strip()
         if proxy_str.startswith("https://"):
@@ -133,7 +132,7 @@ def get_common_yt_dlp_opts() -> dict:
         elif not proxy_str.startswith("http://"):
             proxy_str = "http://" + proxy_str
 
-        opts['proxy'] = proxy_str
+        opts["proxy"] = proxy_str
 
     return opts
 
