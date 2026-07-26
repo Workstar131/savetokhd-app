@@ -130,15 +130,21 @@ async function handleSingleDownload() {
 }
 
 /**
- * Renders the single video result with an <a> tag download link.
- * Uses a real hyperlink (not a button) so the browser treats it as a trusted
- * navigation and never blocks it as a popup.
+ * Renders the single video result and links to the streaming proxy
+ * to trigger the native file download prompt.
  */
 function renderSingleResult(data) {
     elements.results.classList.remove('hidden');
     
-    // Build the proxy-download URL (server does 302 redirect to TikTok CDN)
-    const proxyDownloadUrl = `${API_BASE_URL}/proxy-download?url=${encodeURIComponent(data.download_url)}`;
+    // Create a clean default filename
+    const cleanTitle = (data.title || 'tiktok_video')
+        .replace(/[^a-zA-Z0-9_-]/g, '_')
+        .replace(/_+/g, '_')
+        .slice(0, 30);
+    const fileName = `${cleanTitle}.mp4`;
+    
+    // Build the proxy-download URL with filename instruction
+    const proxyDownloadUrl = `${API_BASE_URL}/proxy-download?url=${encodeURIComponent(data.download_url)}&filename=${encodeURIComponent(fileName)}`;
     
     elements.results.innerHTML = `
         <div class="bg-gray-900 border border-gray-700 rounded-xl overflow-hidden flex flex-col md:flex-row">
@@ -158,8 +164,7 @@ function renderSingleResult(data) {
                 </div>
                 <div class="space-y-3">
                     <a href="${escapeHTML(proxyDownloadUrl)}" 
-                       target="_blank" 
-                       rel="noopener noreferrer"
+                       download="${escapeHTML(fileName)}"
                        class="w-full bg-green-600 hover:bg-green-700 py-3 rounded-lg font-bold text-center block transition flex items-center justify-center gap-2 no-underline text-white"
                        id="btn-download-media">
                         <i data-lucide="download"></i> Download No-Watermark MP4

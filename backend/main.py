@@ -6,7 +6,7 @@ from urllib.parse import quote
 
 from fastapi import FastAPI, HTTPException, status
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import RedirectResponse, StreamingResponse
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 import httpx
 import yt_dlp
@@ -143,12 +143,11 @@ def get_common_yt_dlp_opts() -> dict:
 def extract_download_url(info: dict) -> Optional[str]:
     """
     Extract the DIRECT video download URL from yt-dlp info dict.
-    We need a URL that the browser can download directly (TikTok CDN MP4).
     """
     if not info:
         return None
 
-    # Strategy 1: Top-level 'url' (some extractors set this)
+    # Strategy 1: Top-level 'url'
     raw_url = info.get('url')
     if raw_url and raw_url.startswith('http'):
         return raw_url
@@ -166,10 +165,9 @@ def extract_download_url(info: dict) -> Optional[str]:
             if fmt_url and fmt_url.startswith('http'):
                 return fmt_url
 
-    # Strategy 4: From 'formats' array - THIS IS WHERE TIKTOK PUTS DIRECT MP4 URLs
+    # Strategy 4: From 'formats' array (direct MP4 URLs from CDN)
     formats = info.get('formats')
     if formats:
-        # First pass: prefer direct MP4 URLs from CDN
         for fmt in formats:
             fmt_url = fmt.get('url')
             if not fmt_url or not fmt_url.startswith('http'):
@@ -178,13 +176,12 @@ def extract_download_url(info: dict) -> Optional[str]:
             if ext == 'mp4':
                 return fmt_url
 
-        # Second pass: any valid HTTP URL as fallback
         for fmt in formats:
             fmt_url = fmt.get('url')
             if fmt_url and fmt_url.startswith('http'):
                 return fmt_url
 
-    # Strategy 5: manifest URLs (m3u8) - less ideal but better than nothing
+    # Strategy 5: Manifest URLs (fallback)
     raw_url = info.get('manifest_url') or info.get('hls_manifest_url')
     if raw_url and raw_url.startswith('http'):
         return raw_url
@@ -192,9 +189,7 @@ def extract_download_url(info: dict) -> Optional[str]:
     return None
 
 def extract_thumbnail(info: dict) -> str:
-    """
-    Extract the best thumbnail URL from yt-dlp info dict.
-    """
+    """Extract the best thumbnail URL from yt-dlp info dict."""
     thumb = info.get('thumbnail')
     if thumb and thumb.startswith('http'):
         return thumb
@@ -218,27 +213,18 @@ def extract_thumbnail(info: dict) -> str:
 # =====================================================================
 
 def _sync_download_single(video_url: str) -> dict:
-    """
-    Extracts video metadata and returns the DIRECT TikTok CDN video URL.
-    No proxying - the browser downloads directly from TikTok's CDN.
-    """
     opts = get_common_yt_dlp_opts()
-    opts.update({
-        'format': 'best',
-    })
+    opts.update({'format': 'best'})
 
     with yt_dlp.YoutubeDL(opts) as ydl:
         info = ydl.extract_info(video_url, download=False)
         if not info:
             raise ValueError("TikTok blocked metadata extraction for this link.")
 
-        # Extract the DIRECT CDN URL for the video
         direct_cdn_url = extract_download_url(info)
         if not direct_cdn_url:
             raise ValueError("Could not extract download URL from TikTok video metadata.")
 
-        # Return the direct CDN URL to the frontend.
-        # The browser will open this URL in a new tab and download the MP4 directly.
         return {
             "title": info.get('title', 'TikTok Video'),
             "author": f"@{info.get('uploader_id', info.get('uploader', 'creator'))}",
@@ -300,23 +286,37 @@ async def health_check():
     }
 
 @app.get("/api/proxy-download")
-async def proxy_download(url: str):
+async def proxy_download(url: str, filename: Optional[str] = "tiktok_video.mp4"):
     """
-    Redirects the browser directly to the TikTok CDN video URL.
-    This is much more reliable than streaming because:
-    1. No CORS issues - browser navigates directly to CDN
-    2. Mobile browsers handle direct MP4 URLs natively
-    3. No chunked transfer encoding issues
+    Proxies video stream from TikTok's CDN and forces the browser 
+    to trigger a download dialog using Content-Disposition header.
     """
-    if not url or url == 'none' or url.strip() == '':
+    if not url or url.strip() == '' or url == 'none':
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Missing or invalid download URL."
         )
 
-    # Just redirect the browser directly to the TikTok CDN video
-    # The browser will handle the download natively
-    return RedirectResponse(url=url, status_code=302)
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
+        "Accept": "*/*",
+    }
+
+    async def video_stream():
+        async with httpx.AsyncClient(follow_redirects=True, timeout=30.0) as client:
+            async with client.stream("GET", url, headers=headers) as response:
+                if response.status_code != 200:
+                    raise HTTPException(status_code=400, detail="Failed to retrieve video stream from CDN.")
+                async for chunk in response.aiter_bytes(chunk_size=1024 * 1024):  # 1MB Chunks
+                    yield chunk
+
+    encoded_filename = quote(filename)
+    response_headers = {
+        "Content-Disposition": f'attachment; filename="{encoded_filename}"; filename*=UTF-8\'\'{encoded_filename}',
+        "Content-Type": "video/mp4",
+    }
+
+    return StreamingResponse(video_stream(), headers=response_headers, media_type="video/mp4")
 
 @app.post("/api/download-single", response_model=SingleVideoResponse)
 async def api_download_single(payload: SingleVideoRequest):
