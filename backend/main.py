@@ -288,13 +288,64 @@ async def health_check():
 @app.get("/api/proxy-download")
 async def proxy_download(url: str, filename: Optional[str] = "tiktok_video.mp4"):
     """
-    Proxies video bytes directly from TikTok CDN with required headers
-    so the frontend fetch() call can construct a downloadable Blob object.
+    Proxies video bytes directly from TikTok CDN with required headers.
+    Checks the CDN status code BEFORE starting the streaming response.
     """
     if not url or url.strip() == '' or url == 'none':
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Missing or invalid download URL."
+        )
+
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
+        "Referer": "https://www.tiktok.com/",
+        "Accept": "*/*",
+        "Accept-Encoding": "identity",
+    }
+
+    client = httpx.AsyncClient(follow_redirects=True, timeout=30.0)
+
+    try:
+        # 1. Start connection and check response status code FIRST
+        req = client.build_request("GET", url, headers=headers)
+        res = await client.send(req, stream=True)
+
+        if res.status_code != 200:
+            await res.aclose()
+            await client.aclose()
+            raise HTTPException(
+                status_code=res.status_code,
+                detail=f"TikTok CDN returned HTTP {res.status_code}. CDN link may have expired."
+            )
+
+        # 2. Generator that handles closing connection safely
+        async def video_stream():
+            try:
+                async for chunk in res.aiter_bytes(chunk_size=1024 * 1024):
+                    yield chunk
+            finally:
+                await res.aclose()
+                await client.aclose()
+
+        encoded_filename = quote(filename)
+        response_headers = {
+            "Content-Disposition": f'attachment; filename="{encoded_filename}"; filename*=UTF-8\'\'{encoded_filename}',
+            "Content-Type": res.headers.get("Content-Type", "video/mp4"),
+        }
+
+        return StreamingResponse(
+            video_stream(), 
+            headers=response_headers, 
+            media_type="video/mp4",
+            status_code=200
+        )
+
+    except httpx.RequestError as exc:
+        await client.aclose()
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail=f"Unable to reach TikTok CDN: {str(exc)}"
         )
 
     # TikTok CDN strictly requires these headers to avoid 403 blocks
