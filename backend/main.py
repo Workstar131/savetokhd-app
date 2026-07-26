@@ -15,6 +15,8 @@ import yt_dlp
 # CONFIGURATION & PROXY SETUP
 # =====================================================================
 
+# You mentioned disabling this, but we leave the env read in case you 
+# re-enable it for yt-dlp metadata extraction in the future.
 DATAIMPULSE_PROXY = os.getenv("PROXY_URL")
 
 app = FastAPI(
@@ -288,8 +290,8 @@ async def health_check():
 @app.get("/api/proxy-download")
 async def proxy_download(url: str, filename: Optional[str] = "tiktok_video.mp4"):
     """
-    Proxies video stream from TikTok's CDN and forces the browser 
-    to trigger a download dialog using Content-Disposition header.
+    Proxies video bytes directly from TikTok CDN with required headers
+    to trigger a native browser download prompt.
     """
     if not url or url.strip() == '' or url == 'none':
         raise HTTPException(
@@ -297,17 +299,23 @@ async def proxy_download(url: str, filename: Optional[str] = "tiktok_video.mp4")
             detail="Missing or invalid download URL."
         )
 
+    # TikTok CDN strictly checks for these headers or it rejects the request
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
+        "Referer": "https://www.tiktok.com/",
         "Accept": "*/*",
+        "Accept-Encoding": "identity",  # Ensure uncompressed video chunks
     }
 
     async def video_stream():
         async with httpx.AsyncClient(follow_redirects=True, timeout=30.0) as client:
             async with client.stream("GET", url, headers=headers) as response:
                 if response.status_code != 200:
-                    raise HTTPException(status_code=400, detail="Failed to retrieve video stream from CDN.")
-                async for chunk in response.aiter_bytes(chunk_size=1024 * 1024):  # 1MB Chunks
+                    raise HTTPException(
+                        status_code=response.status_code, 
+                        detail=f"TikTok CDN returned status code {response.status_code}"
+                    )
+                async for chunk in response.aiter_bytes(chunk_size=1024 * 1024):  # 1MB chunks
                     yield chunk
 
     encoded_filename = quote(filename)

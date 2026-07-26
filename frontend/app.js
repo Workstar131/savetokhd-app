@@ -130,20 +130,20 @@ async function handleSingleDownload() {
 }
 
 /**
- * Renders the single video result and links to the streaming proxy
- * to trigger the native file download prompt.
+ * Renders the single video result and routes the download through our proxy
+ * endpoint to trigger the browser's native file download prompt.
  */
 function renderSingleResult(data) {
     elements.results.classList.remove('hidden');
     
-    // Create a clean default filename
+    // Create a safe, clean file name
     const cleanTitle = (data.title || 'tiktok_video')
         .replace(/[^a-zA-Z0-9_-]/g, '_')
         .replace(/_+/g, '_')
         .slice(0, 30);
     const fileName = `${cleanTitle}.mp4`;
     
-    // Build the proxy-download URL with filename instruction
+    // Construct the backend proxy URL that forces file attachment
     const proxyDownloadUrl = `${API_BASE_URL}/proxy-download?url=${encodeURIComponent(data.download_url)}&filename=${encodeURIComponent(fileName)}`;
     
     elements.results.innerHTML = `
