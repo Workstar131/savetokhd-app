@@ -136,70 +136,32 @@ def get_common_yt_dlp_opts() -> dict:
 
     return opts
 
-# =====================================================================
-# URL EXTRACTION HELPER
-# =====================================================================
-
 def extract_download_url(info: dict) -> Optional[str]:
-    """Extract the DIRECT video download URL from yt-dlp info dict."""
+    """Extract direct video download URL from yt-dlp info dict."""
     if not info:
         return None
 
-    # Strategy 1: Top-level 'url'
-    raw_url = info.get('url')
+    raw_url = info.get('url') or info.get('video_url')
     if raw_url and raw_url.startswith('http'):
         return raw_url
 
-    # Strategy 2: 'video_url' field
-    raw_url = info.get('video_url')
-    if raw_url and raw_url.startswith('http'):
-        return raw_url
-
-    # Strategy 3: From 'requested_formats'
-    requested_formats = info.get('requested_formats')
-    if requested_formats:
-        for fmt in requested_formats:
-            fmt_url = fmt.get('url')
-            if fmt_url and fmt_url.startswith('http'):
-                return fmt_url
-
-    # Strategy 4: From 'formats' array (direct MP4 URLs from CDN)
     formats = info.get('formats')
     if formats:
         for fmt in formats:
             fmt_url = fmt.get('url')
-            if not fmt_url or not fmt_url.startswith('http'):
-                continue
-            ext = fmt.get('ext', '')
-            if ext == 'mp4':
+            if fmt_url and fmt_url.startswith('http') and fmt.get('ext') == 'mp4':
                 return fmt_url
-
-        for fmt in formats:
-            fmt_url = fmt.get('url')
-            if fmt_url and fmt_url.startswith('http'):
-                return fmt_url
-
-    # Strategy 5: Manifest URLs (fallback)
-    raw_url = info.get('manifest_url') or info.get('hls_manifest_url')
-    if raw_url and raw_url.startswith('http'):
-        return raw_url
 
     return None
 
 def extract_thumbnail(info: dict) -> str:
-    """Extract the best thumbnail URL from yt-dlp info dict."""
+    """Extract thumbnail URL from yt-dlp info dict."""
     thumb = info.get('thumbnail')
     if thumb and thumb.startswith('http'):
         return thumb
 
     thumbnails = info.get('thumbnails')
     if thumbnails and isinstance(thumbnails, list):
-        for t in thumbnails:
-            if t.get('id') == 'origin_cover' and t.get('url'):
-                return t['url']
-        for t in thumbnails:
-            if t.get('id') == 'cover' and t.get('url'):
-                return t['url']
         for t in thumbnails:
             if t.get('url') and t['url'].startswith('http'):
                 return t['url']
@@ -274,6 +236,21 @@ def _sync_extract_bulk(username: str) -> dict:
         "videos": raw_videos
     }
 
+def _fetch_stream_url(target_url: str) -> str:
+    """Helper that extracts a fresh streamable URL or verifies direct CDN connection."""
+    target_url = clean_tiktok_url(target_url)
+    
+    # If standard web link passed, extract fresh direct CDN URL instantly
+    if "tiktok.com" in target_url and "v19-webapp" not in target_url:
+        opts = get_common_yt_dlp_opts()
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            info = ydl.extract_info(target_url, download=False)
+            fresh_url = extract_download_url(info)
+            if fresh_url:
+                return fresh_url
+
+    return target_url
+
 # =====================================================================
 # API ENDPOINTS
 # =====================================================================
@@ -289,7 +266,7 @@ async def health_check():
 @app.get("/api/proxy-download")
 async def proxy_download(url: str, filename: Optional[str] = "tiktok_video.mp4"):
     """
-    Proxies video bytes directly from TikTok CDN with realistic browser headers.
+    Proxies video bytes safely by dynamically resolving direct CDN access on-the-fly.
     """
     if not url or url.strip() == '' or url == 'none':
         raise HTTPException(
@@ -297,7 +274,9 @@ async def proxy_download(url: str, filename: Optional[str] = "tiktok_video.mp4")
             detail="Missing or invalid download URL."
         )
 
-    # Realistic browser headers to pass TikTok CDN checks
+    # 1. Resolve to a fresh streamable URL in thread pool
+    stream_url = await asyncio.to_thread(_fetch_stream_url, url)
+
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
         "Referer": "https://www.tiktok.com/",
@@ -305,16 +284,12 @@ async def proxy_download(url: str, filename: Optional[str] = "tiktok_video.mp4")
         "Accept-Encoding": "identity",
         "Accept-Language": "en-US,en;q=0.9",
         "Range": "bytes=0-",
-        "Sec-Fetch-Dest": "video",
-        "Sec-Fetch-Mode": "cors",
-        "Sec-Fetch-Site": "cross-site",
     }
 
-    # Disabled strict SSL verification to prevent handshake errors on rotating CDN domains
     client = httpx.AsyncClient(follow_redirects=True, timeout=30.0, verify=False)
 
     try:
-        req = client.build_request("GET", url, headers=headers)
+        req = client.build_request("GET", stream_url, headers=headers)
         res = await client.send(req, stream=True)
 
         if res.status_code not in (200, 206):
@@ -322,7 +297,7 @@ async def proxy_download(url: str, filename: Optional[str] = "tiktok_video.mp4")
             await client.aclose()
             raise HTTPException(
                 status_code=res.status_code,
-                detail=f"TikTok CDN returned status code {res.status_code}."
+                detail=f"TikTok CDN returned HTTP {res.status_code}."
             )
 
         async def video_stream():
@@ -350,7 +325,7 @@ async def proxy_download(url: str, filename: Optional[str] = "tiktok_video.mp4")
         await client.aclose()
         raise HTTPException(
             status_code=status.HTTP_502_BAD_GATEWAY,
-            detail=f"Unable to stream from TikTok CDN: {str(exc)}"
+            detail=f"Unable to stream video: {str(exc)}"
         )
 
 @app.post("/api/download-single", response_model=SingleVideoResponse)
