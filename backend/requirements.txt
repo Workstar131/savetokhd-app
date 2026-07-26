@@ -1,6 +1,5 @@
-fastapi
-uvicorn
-pydantic
-httpx
-requests
-yt-dlp
+fastapi==0.115.6
+uvicorn[standard]==0.34.0
+yt-dlp==2025.1.26
+httpx==0.28.1
+pydantic==2.10.4

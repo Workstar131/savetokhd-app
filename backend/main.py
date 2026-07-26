@@ -1,375 +1,218 @@
+"""
+TikTokExtract API — FastAPI Backend
+
+Production-grade backend for TikTok video downloading and bulk profile extraction.
+Matches the frontend contract defined in the static HTML/JS client.
+
+Endpoints:
+  GET  /api/health            — Health check
+  POST /api/download-single   — Extract single video metadata
+  POST /api/extract-bulk      — Extract bulk profile metadata
+  GET  /api/proxy-download    — Stream a video from TikTok CDN via server proxy
+"""
+
 import asyncio
-import os
+import logging
 import re
-from typing import Optional, List
-from urllib.parse import quote
+from urllib.parse import urlparse
 
-from fastapi import FastAPI, HTTPException, status
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
-from pydantic import BaseModel
 import httpx
-import yt_dlp
+from fastapi import FastAPI, HTTPException, Query
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse, StreamingResponse
 
-# =====================================================================
-# CONFIGURATION & PROXY SETUP
-# =====================================================================
+from config import settings
+from schemas.payload_models import (
+    BulkExtractRequest,
+    BulkExtractResponse,
+    HealthResponse,
+    SingleDownloadRequest,
+    SingleVideoResponse,
+)
+from services.tiktok_service import extract_bulk_profile, extract_single_video
+from utils.formatters import is_valid_tiktok_url
 
-DATAIMPULSE_PROXY = os.getenv("PROXY_URL")
+# ─── Logging ──────────────────────────────────────────────────────
+
+logging.basicConfig(
+    level=logging.INFO if not settings.DEBUG else logging.DEBUG,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+)
+logger = logging.getLogger("tiktokextract")
+
+# ─── App ──────────────────────────────────────────────────────────
 
 app = FastAPI(
-    title="SaveTokHD Engine",
-    description="Asynchronous backend API for TikTok extraction and downloading.",
-    version="2.0.0"
+    title=settings.APP_NAME,
+    version=settings.APP_VERSION,
+    docs_url="/docs",
+    redoc_url="/redoc",
 )
 
-# CORS Configuration
+# ─── CORS Middleware ──────────────────────────────────────────────
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=settings.CORS_ORIGINS,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
-    expose_headers=["Content-Disposition", "Content-Type", "Content-Length", "Location"],
 )
 
-# =====================================================================
-# SCHEMAS
-# =====================================================================
 
-class SingleVideoRequest(BaseModel):
-    url: str
+# ─── Custom Exception Handlers ────────────────────────────────────
 
-class SingleVideoResponse(BaseModel):
-    title: str
-    author: str
-    views: str
-    thumbnail: str
-    download_url: str
+@app.exception_handler(ValueError)
+async def value_error_handler(request, exc: ValueError):
+    """Handle validation errors (invalid URLs, bad usernames)."""
+    return JSONResponse(
+        status_code=400,
+        content={"detail": str(exc)},
+    )
 
-class BulkExtractRequest(BaseModel):
-    username: str
-    delay: Optional[float] = 1.0
 
-class BulkVideoItem(BaseModel):
-    id: str
-    caption: str
-    views: str
-    duration: str
-    url: str
+@app.exception_handler(RuntimeError)
+async def runtime_error_handler(request, exc: RuntimeError):
+    """Handle runtime errors (private videos, extractor failures)."""
+    return JSONResponse(
+        status_code=404,
+        content={"detail": str(exc)},
+    )
 
-class BulkExtractResponse(BaseModel):
-    username: str
-    total_videos: int
-    videos: List[BulkVideoItem]
 
-# =====================================================================
-# HELPER FUNCTIONS
-# =====================================================================
+# ─── Endpoints ────────────────────────────────────────────────────
 
-def clean_tiktok_url(text: str) -> str:
-    """Extracts valid HTTP/HTTPS URL and resolves short links."""
-    match = re.search(r'https?://[^\s]+', text)
-    if not match:
-        return text.strip()
-
-    url = match.group(0)
-
-    if "vm.tiktok.com" in url or "vt.tiktok.com" in url:
-        try:
-            headers = {
-                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
-            }
-            with httpx.Client(follow_redirects=True, timeout=8.0, headers=headers) as client:
-                res = client.get(url)
-                if res.status_code == 200:
-                    url = str(res.url)
-        except Exception:
-            pass
-
-    return url
-
-def format_count(count: Optional[int]) -> str:
-    if not count:
-        return "N/A"
-    if count >= 1_000_000:
-        return f"{count / 1_000_000:.1f}M"
-    if count >= 1_000:
-        return f"{count / 1_000:.1f}K"
-    return str(count)
-
-def format_duration(seconds: Optional[float]) -> str:
-    if not seconds:
-        return "00:00"
-    mins, secs = divmod(int(seconds), 60)
-    return f"{mins:02d}:{secs:02d}"
-
-def get_common_yt_dlp_opts() -> dict:
-    """Options with realistic browser headers and mobile API fallback to bypass TikTok blocks."""
-    opts = {
-        'quiet': True,
-        'no_warnings': True,
-        'ignoreerrors': False,
-        'socket_timeout': 15,
-        'geo_bypass': True,
-        'extractor_args': {
-            'tiktok': {
-                'app_version': '31.5.3',
-                'manifest_app_version': '3153',
-            }
-        },
-        'http_headers': {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36',
-            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
-            'Accept-Language': 'en-US,en;q=0.9',
-            'Sec-Fetch-Mode': 'navigate',
-        }
-    }
-    if DATAIMPULSE_PROXY and DATAIMPULSE_PROXY.strip():
-        proxy_str = DATAIMPULSE_PROXY.strip()
-        if proxy_str.startswith("https://"):
-            proxy_str = "http://" + proxy_str[8:]
-        elif not proxy_str.startswith("http://"):
-            proxy_str = "http://" + proxy_str
-
-        opts["proxy"] = proxy_str
-
-    return opts
-
-def extract_download_url(info: dict) -> Optional[str]:
-    """Extract direct video download URL from yt-dlp info dict."""
-    if not info:
-        return None
-
-    raw_url = info.get('url') or info.get('video_url')
-    if raw_url and raw_url.startswith('http'):
-        return raw_url
-
-    formats = info.get('formats')
-    if formats:
-        for fmt in formats:
-            fmt_url = fmt.get('url')
-            if fmt_url and fmt_url.startswith('http') and fmt.get('ext') == 'mp4':
-                return fmt_url
-
-    return None
-
-def extract_thumbnail(info: dict) -> str:
-    """Extract thumbnail URL from yt-dlp info dict."""
-    thumb = info.get('thumbnail')
-    if thumb and thumb.startswith('http'):
-        return thumb
-
-    thumbnails = info.get('thumbnails')
-    if thumbnails and isinstance(thumbnails, list):
-        for t in thumbnails:
-            if t.get('url') and t['url'].startswith('http'):
-                return t['url']
-
-    return ''
-
-# =====================================================================
-# SYNCHRONOUS EXTRACTORS
-# =====================================================================
-
-def _sync_download_single(video_url: str) -> dict:
-    opts = get_common_yt_dlp_opts()
-    opts.update({
-        'format': 'bestvideo+bestaudio/best',
-        'format_sort': ['res', 'ext:mp4:m4a'],
-    })
-
-    with yt_dlp.YoutubeDL(opts) as ydl:
-        info = ydl.extract_info(video_url, download=False)
-        if not info:
-            raise ValueError("TikTok blocked metadata extraction for this link.")
-
-        direct_cdn_url = extract_download_url(info)
-        if not direct_cdn_url:
-            raise ValueError("Could not extract download URL from TikTok video metadata.")
-
-        return {
-            "title": info.get('title', 'TikTok Video'),
-            "author": f"@{info.get('uploader_id', info.get('uploader', 'creator'))}",
-            "views": format_count(info.get('view_count')),
-            "thumbnail": extract_thumbnail(info),
-            "download_url": direct_cdn_url
-        }
-
-def _sync_extract_bulk(username: str) -> dict:
-    clean_user = username.replace('@', '').strip()
-    profile_url = f"https://www.tiktok.com/@{clean_user}"
-    
-    opts = get_common_yt_dlp_opts()
-    opts.update({
-        'extract_flat': True,
-        'skip_download': True,
-    })
-
-    raw_videos = []
-    with yt_dlp.YoutubeDL(opts) as ydl:
-        info = ydl.extract_info(profile_url, download=False)
-        if not info or 'entries' not in info:
-            raise ValueError("Could not find public profile or videos.")
-
-        entries = list(info['entries'])
-        for entry in entries:
-            if not entry:
-                continue
-            
-            video_id = entry.get('id')
-            v_url = entry.get('url')
-            if not v_url and video_id:
-                v_url = f"https://www.tiktok.com/@{clean_user}/video/{video_id}"
-
-            raw_videos.append({
-                "id": str(video_id or len(raw_videos) + 1),
-                "caption": entry.get('title', 'No description'),
-                "views": format_count(entry.get('view_count')),
-                "duration": format_duration(entry.get('duration')),
-                "url": v_url or "#"
-            })
-
-    return {
-        "username": f"@{clean_user}",
-        "total_videos": len(raw_videos),
-        "videos": raw_videos
-    }
-
-def _fetch_stream_url(target_url: str) -> str:
-    """Helper that extracts a fresh streamable URL or verifies direct CDN connection."""
-    target_url = clean_tiktok_url(target_url)
-    
-    # If standard web link passed, extract fresh direct CDN URL instantly
-    if "tiktok.com" in target_url and "v19-webapp" not in target_url:
-        opts = get_common_yt_dlp_opts()
-        with yt_dlp.YoutubeDL(opts) as ydl:
-            info = ydl.extract_info(target_url, download=False)
-            fresh_url = extract_download_url(info)
-            if fresh_url:
-                return fresh_url
-
-    return target_url
-
-# =====================================================================
-# API ENDPOINTS
-# =====================================================================
-
-@app.get("/api/health")
+@app.get("/api/health", response_model=HealthResponse, tags=["Health"])
 async def health_check():
-    return {
-        "status": "online", 
-        "domain": "savetokhd.com", 
-        "yt_dlp_version": yt_dlp.version.__version__
-    }
+    """Health check endpoint. Returns service status and version."""
+    return HealthResponse(status="healthy", version=settings.APP_VERSION)
 
-@app.get("/api/proxy-download")
-async def proxy_download(url: str, filename: Optional[str] = "tiktok_video.mp4"):
+
+@app.post(
+    "/api/download-single",
+    response_model=SingleVideoResponse,
+    tags=["Download"],
+)
+async def download_single(request: SingleDownloadRequest):
     """
-    Proxies video bytes safely by dynamically resolving direct CDN access on-the-fly.
+    Extract metadata for a single TikTok video.
+
+    Validates the URL, runs yt-dlp to parse video details without downloading,
+    and returns metadata including a watermark-free CDN download URL.
     """
-    if not url or url.strip() == '' or url == 'none':
+    url = request.url.strip()
+
+    # Validate URL
+    if not is_valid_tiktok_url(url):
         raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Missing or invalid download URL."
+            status_code=400,
+            detail="Invalid TikTok URL. Please provide a valid link from tiktok.com, vm.tiktok.com, or vt.tiktok.com.",
         )
 
-    # 1. Resolve to a fresh streamable URL in thread pool
-    stream_url = await asyncio.to_thread(_fetch_stream_url, url)
+    try:
+        data = await extract_single_video(url)
+        logger.info("Successfully extracted single video: %s", data.get("title", "unknown"))
+        return SingleVideoResponse(**data)
+    except ValueError:
+        raise
+    except RuntimeError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+    except Exception as exc:
+        logger.error("Unexpected error in download-single: %s", exc)
+        raise HTTPException(
+            status_code=500,
+            detail="Internal server error. Please try again later.",
+        )
+
+
+@app.post(
+    "/api/extract-bulk",
+    response_model=BulkExtractResponse,
+    tags=["Bulk"],
+)
+async def extract_bulk(request: BulkExtractRequest):
+    """
+    Extract metadata for all public videos on a TikTok profile.
+
+    Accepts a username (with or without @) and optional delay between requests.
+    Returns structured video metadata suitable for table display and CSV export.
+    """
+    username = request.username.strip()
+    if not username:
+        raise HTTPException(status_code=400, detail="Username cannot be empty.")
+
+    try:
+        data = await extract_bulk_profile(username, delay=request.delay)
+        logger.info(
+            "Successfully extracted %d videos for %s",
+            data["total_videos"],
+            data["username"],
+        )
+        return BulkExtractResponse(**data)
+    except RuntimeError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+    except Exception as exc:
+        logger.error("Unexpected error in extract-bulk: %s", exc)
+        raise HTTPException(
+            status_code=500,
+            detail="Internal server error. Please try again later.",
+        )
+
+
+@app.get("/api/proxy-download", tags=["Download"])
+async def proxy_download(url: str = Query(..., description="Encoded TikTok CDN video URL")):
+    """
+    Proxy a video download from TikTok's CDN.
+
+    Streams the video through this server with spoofed headers so that
+    TikTok's CDN accepts the request. Uses StreamingResponse to keep
+    server memory usage low.
+    """
+    if not url:
+        raise HTTPException(status_code=400, detail="Missing 'url' parameter.")
+
+    # Validate that the URL points to a TikTok-related domain
+    try:
+        parsed = urlparse(url)
+        allowed_domains = ("tiktok.com", "tiktokcdn.com", "tiktokv.com")
+        if not any(parsed.hostname and d in parsed.hostname for d in allowed_domains):
+            raise HTTPException(
+                status_code=400,
+                detail="URL must point to a TikTok CDN or video domain.",
+            )
+    except HTTPException:
+        raise
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid URL format.")
 
     headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
-        "Referer": "https://www.tiktok.com/",
+        "User-Agent": settings.DEFAULT_USER_AGENT,
+        "Referer": settings.DEFAULT_REFERER,
         "Accept": "*/*",
-        "Accept-Encoding": "identity",
+        "Accept-Encoding": "identity",  # Prevent gzip to stream raw bytes
         "Accept-Language": "en-US,en;q=0.9",
-        "Range": "bytes=0-",
     }
 
-    client = httpx.AsyncClient(follow_redirects=True, timeout=30.0, verify=False)
-
-    try:
-        req = client.build_request("GET", stream_url, headers=headers)
-        res = await client.send(req, stream=True)
-
-        if res.status_code not in (200, 206):
-            await res.aclose()
-            await client.aclose()
-            raise HTTPException(
-                status_code=res.status_code,
-                detail=f"TikTok CDN returned HTTP {res.status_code}."
-            )
-
-        async def video_stream():
-            try:
-                async for chunk in res.aiter_bytes(chunk_size=1024 * 1024):
+    async def stream_content():
+        async with httpx.AsyncClient(follow_redirects=True, timeout=60.0) as client:
+            async with client.stream("GET", url, headers=headers) as response:
+                response.raise_for_status()
+                async for chunk in response.aiter_bytes(chunk_size=settings.PROXY_CHUNK_SIZE):
                     yield chunk
-            finally:
-                await res.aclose()
-                await client.aclose()
 
-        encoded_filename = quote(filename)
-        response_headers = {
-            "Content-Disposition": f'attachment; filename="{encoded_filename}"; filename*=UTF-8\'\'{encoded_filename}',
-            "Content-Type": res.headers.get("Content-Type", "video/mp4"),
-        }
+    return StreamingResponse(
+        stream_content(),
+        media_type="video/mp4",
+        headers={
+            "Content-Disposition": 'attachment; filename="tiktok_video_nowatermark.mp4"',
+            "Cache-Control": "no-cache",
+        },
+    )
 
-        return StreamingResponse(
-            video_stream(), 
-            headers=response_headers, 
-            media_type="video/mp4",
-            status_code=200
-        )
 
-    except httpx.RequestError as exc:
-        await client.aclose()
-        raise HTTPException(
-            status_code=status.HTTP_502_BAD_GATEWAY,
-            detail=f"Unable to stream video: {str(exc)}"
-        )
+# ─── Root redirect (optional) ─────────────────────────────────────
 
-@app.post("/api/download-single", response_model=SingleVideoResponse)
-async def api_download_single(payload: SingleVideoRequest):
-    sanitized_url = clean_tiktok_url(payload.url)
-
-    if "tiktok.com" not in sanitized_url:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST, 
-            detail="Invalid URL. Please enter a valid TikTok link."
-        )
-
-    try:
-        data = await asyncio.to_thread(_sync_download_single, sanitized_url)
-        return data
-    except ValueError as e:
-        raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            detail=f"Extraction failed: {str(e)}"
-        )
-    except Exception as e:
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Error: {str(e)}"
-        )
-
-@app.post("/api/extract-bulk", response_model=BulkExtractResponse)
-async def api_extract_bulk(payload: BulkExtractRequest):
-    if not payload.username:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST, 
-            detail="Username or profile link is required."
-        )
-
-    try:
-        data = await asyncio.to_thread(_sync_extract_bulk, payload.username)
-        return data
-    except ValueError as e:
-        raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            detail=f"Extraction failed: {str(e)}"
-        )
-    except Exception as e:
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Error: {str(e)}"
-        )
+@app.get("/")
+async def root():
+    """Redirect root to the API documentation."""
+    return {"message": "TikTokExtract API v" + settings.APP_VERSION, "docs": "/docs"}
