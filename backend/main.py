@@ -212,7 +212,10 @@ def extract_thumbnail(info: dict) -> str:
 
 def _sync_download_single(video_url: str) -> dict:
     opts = get_common_yt_dlp_opts()
-    opts.update({'format': 'best'})
+    opts.update({
+        'format': 'bestvideo+bestaudio/best',
+        'format_sort': ['res', 'ext:mp4:m4a'],
+    })
 
     with yt_dlp.YoutubeDL(opts) as ydl:
         info = ydl.extract_info(video_url, download=False)
@@ -287,7 +290,6 @@ async def health_check():
 async def proxy_download(url: str, filename: Optional[str] = "tiktok_video.mp4"):
     """
     Proxies video bytes directly from TikTok CDN with realistic browser headers.
-    Falls back to yt-dlp native extraction if TikTok returns 403 Forbidden.
     """
     if not url or url.strip() == '' or url == 'none':
         raise HTTPException(
@@ -295,36 +297,32 @@ async def proxy_download(url: str, filename: Optional[str] = "tiktok_video.mp4")
             detail="Missing or invalid download URL."
         )
 
+    # Realistic browser headers to pass TikTok CDN checks
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
         "Referer": "https://www.tiktok.com/",
         "Accept": "*/*",
         "Accept-Encoding": "identity",
         "Accept-Language": "en-US,en;q=0.9",
-        "Range": "bytes=0-",  # Critical to bypass 403 blocks on TikTok CDN
+        "Range": "bytes=0-",
         "Sec-Fetch-Dest": "video",
         "Sec-Fetch-Mode": "cors",
         "Sec-Fetch-Site": "cross-site",
     }
 
-    client = httpx.AsyncClient(follow_redirects=True, timeout=30.0)
+    # Disabled strict SSL verification to prevent handshake errors on rotating CDN domains
+    client = httpx.AsyncClient(follow_redirects=True, timeout=30.0, verify=False)
 
     try:
         req = client.build_request("GET", url, headers=headers)
         res = await client.send(req, stream=True)
-
-        # If CDN returns 403, run through yt_dlp fallback handler
-        if res.status_code == 403:
-            await res.aclose()
-            await client.aclose()
-            return await _fallback_yt_dlp_stream(url, filename)
 
         if res.status_code not in (200, 206):
             await res.aclose()
             await client.aclose()
             raise HTTPException(
                 status_code=res.status_code,
-                detail=f"TikTok CDN returned status code {res.status_code}"
+                detail=f"TikTok CDN returned status code {res.status_code}."
             )
 
         async def video_stream():
@@ -348,54 +346,12 @@ async def proxy_download(url: str, filename: Optional[str] = "tiktok_video.mp4")
             status_code=200
         )
 
-    except httpx.RequestError:
+    except httpx.RequestError as exc:
         await client.aclose()
-        return await _fallback_yt_dlp_stream(url, filename)
-
-
-async def _fallback_yt_dlp_stream(url: str, filename: str):
-    """Fallback handler that uses yt_dlp options to re-extract direct URL when blocked."""
-    opts = get_common_yt_dlp_opts()
-    
-    def _extract():
-        with yt_dlp.YoutubeDL(opts) as ydl:
-            info = ydl.extract_info(url, download=False)
-            return extract_download_url(info)
-
-    try:
-        fresh_url = await asyncio.to_thread(_extract)
-        if not fresh_url:
-            raise HTTPException(status_code=403, detail="TikTok CDN blocked access.")
-
-        client = httpx.AsyncClient(follow_redirects=True, timeout=30.0)
-        headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
-            "Referer": "https://www.tiktok.com/",
-            "Range": "bytes=0-",
-        }
-        
-        req = client.build_request("GET", fresh_url, headers=headers)
-        res = await client.send(req, stream=True)
-
-        async def video_stream():
-            try:
-                async for chunk in res.aiter_bytes(chunk_size=1024 * 1024):
-                    yield chunk
-            finally:
-                await res.aclose()
-                await client.aclose()
-
-        encoded_filename = quote(filename)
-        response_headers = {
-            "Content-Disposition": f'attachment; filename="{encoded_filename}"; filename*=UTF-8\'\'{encoded_filename}',
-            "Content-Type": "video/mp4",
-        }
-
-        return StreamingResponse(video_stream(), headers=response_headers, media_type="video/mp4")
-
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Download failed: {str(e)}")
-
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail=f"Unable to stream from TikTok CDN: {str(exc)}"
+        )
 
 @app.post("/api/download-single", response_model=SingleVideoResponse)
 async def api_download_single(payload: SingleVideoRequest):
