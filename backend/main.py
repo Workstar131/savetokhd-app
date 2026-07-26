@@ -11,13 +11,11 @@ Endpoints:
   GET  /api/proxy-download    — Stream a video from TikTok CDN via server proxy
 """
 
-import asyncio
 import logging
-import re
 from urllib.parse import urlparse
 
 import httpx
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
 
@@ -51,14 +49,28 @@ app = FastAPI(
 
 # ─── CORS Middleware ──────────────────────────────────────────────
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=settings.CORS_ORIGINS,
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
+if settings.CORS_ALLOW_ALL:
+    # Allow all origins (for debugging / open access)
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=["*"],
+        allow_methods=["*"],
+        allow_headers=["*"],
+        allow_credentials=True,
+        expose_headers=["*"],
+        max_age=600,
+    )
+else:
+    # Explicit origins list for production
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=settings.CORS_ORIGINS,
+        allow_credentials=True,
+        allow_methods=["*"],
+        allow_headers=["*"],
+        expose_headers=["*"],
+        max_age=600,
+    )
 
 # ─── Custom Exception Handlers ────────────────────────────────────
 
@@ -210,9 +222,9 @@ async def proxy_download(url: str = Query(..., description="Encoded TikTok CDN v
     )
 
 
-# ─── Root redirect (optional) ─────────────────────────────────────
+# ─── Root endpoint ────────────────────────────────────────────────
 
 @app.get("/")
 async def root():
-    """Redirect root to the API documentation."""
+    """Root endpoint — returns API info."""
     return {"message": "TikTokExtract API v" + settings.APP_VERSION, "docs": "/docs"}

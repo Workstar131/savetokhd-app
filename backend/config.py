@@ -3,12 +3,10 @@ Application settings and environment configuration.
 All tunable parameters are centralized here for easy management.
 """
 
-from pydantic import BaseModel
-from typing import Optional
 import os
 
 
-class Settings(BaseModel):
+class Settings:
     # Application metadata
     APP_NAME: str = "TikTokExtract API"
     APP_VERSION: str = "1.0.0"
@@ -18,11 +16,23 @@ class Settings(BaseModel):
     HOST: str = os.getenv("HOST", "0.0.0.0")
     PORT: int = int(os.getenv("PORT", "8000"))
 
-    # CORS allowed origins — in production this should be restricted
-    CORS_ORIGINS: list[str] = os.getenv(
-        "CORS_ORIGINS",
-        "https://savetokhd-app.onrender.com,http://localhost:5500,http://127.0.0.1:5500"
-    ).split(",")
+    # CORS allowed origins — include all known frontend domains
+    # Render.com proxies may present different origin headers, so we include
+    # both the .onrender.com domain and the custom domain.
+    CORS_ORIGINS: list[str] = [
+        origin.strip()
+        for origin in os.getenv(
+            "CORS_ORIGINS",
+            "https://savetokhd-app.onrender.com,https://savetokhd.com,http://localhost:5500,http://127.0.0.1:5500,http://localhost:3000",
+        ).split(",")
+        if origin.strip()
+    ]
+
+    # If "*" is in the env var, allow all origins (useful for debugging)
+    CORS_ALLOW_ALL: bool = any(
+        origin.strip() == "*"
+        for origin in os.getenv("CORS_ORIGINS", "").split(",")
+    )
 
     # yt-dlp configuration
     YT_DLP_MAX_RETRIES: int = 3
