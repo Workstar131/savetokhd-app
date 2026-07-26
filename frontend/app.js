@@ -2,7 +2,6 @@
 lucide.createIcons();
 
 // Configuration
-// In production, change this to your actual backend domain (e.g., https://api.savetokhd.com/api)
 const API_BASE_URL = window.location.hostname === 'localhost' || window.location.hostname === '127.0.0.1' 
     ? "http://127.0.0.1:8000/api" 
     : "https://savetokhd-app.onrender.com/api";
@@ -19,7 +18,7 @@ async function checkBackendHealth() {
 }
 checkBackendHealth();
 
-// State management for bulk data
+// State management
 let currentBulkData = null;
 
 // UI Elements
@@ -41,59 +40,11 @@ const elements = {
 
 // --- Security Helpers ---
 
-/**
- * Sanitizes strings to prevent XSS when injecting into innerHTML
- * @param {string} str 
- * @returns {string}
- */
 function escapeHTML(str) {
     if (!str) return "";
     const div = document.createElement('div');
     div.textContent = str;
     return div.innerHTML;
-}
-
-// --- Download Trigger (Direct Open Method) ---
-
-/**
- * Opens the video URL directly so the browser downloads it natively.
- * Uses the backend /api/proxy-download endpoint which redirects to the CDN.
- * This is the most reliable method across all browsers and devices.
- * @param {string} videoUrl - The direct TikTok CDN video URL
- * @param {HTMLElement} buttonElement 
- */
-function downloadVideoFile(videoUrl, buttonElement) {
-    const originalHTML = buttonElement.innerHTML;
-
-    try {
-        buttonElement.disabled = true;
-        buttonElement.innerHTML = `<i data-lucide="loader-2" class="w-5 h-5 animate-spin"></i> Downloading...`;
-        if (window.lucide) lucide.createIcons();
-
-        // Build the proxy-download URL which will 302-redirect to the TikTok CDN
-        const proxyUrl = `${API_BASE_URL}/proxy-download?url=${encodeURIComponent(videoUrl)}`;
-
-        // Open in a new tab - browser handles the download natively
-        window.open(proxyUrl, '_blank');
-
-        // Show confirmation
-        setTimeout(() => {
-            buttonElement.innerHTML = `<i data-lucide="check-circle" class="w-5 h-5"></i> Downloading!`;
-            if (window.lucide) lucide.createIcons();
-            setTimeout(() => {
-                buttonElement.disabled = false;
-                buttonElement.innerHTML = originalHTML;
-                if (window.lucide) lucide.createIcons();
-            }, 3000);
-        }, 500);
-
-    } catch (err) {
-        alert("Download failed. Please try again.");
-        console.error("File download error:", err);
-        buttonElement.disabled = false;
-        buttonElement.innerHTML = originalHTML;
-        if (window.lucide) lucide.createIcons();
-    }
 }
 
 // --- UI Logic ---
@@ -178,8 +129,17 @@ async function handleSingleDownload() {
     }
 }
 
+/**
+ * Renders the single video result with an <a> tag download link.
+ * Uses a real hyperlink (not a button) so the browser treats it as a trusted
+ * navigation and never blocks it as a popup.
+ */
 function renderSingleResult(data) {
     elements.results.classList.remove('hidden');
+    
+    // Build the proxy-download URL (server does 302 redirect to TikTok CDN)
+    const proxyDownloadUrl = `${API_BASE_URL}/proxy-download?url=${encodeURIComponent(data.download_url)}`;
+    
     elements.results.innerHTML = `
         <div class="bg-gray-900 border border-gray-700 rounded-xl overflow-hidden flex flex-col md:flex-row">
             <div class="md:w-1/3 relative group">
@@ -197,20 +157,18 @@ function renderSingleResult(data) {
                     </div>
                 </div>
                 <div class="space-y-3">
-                    <button id="btn-download-media" data-url="${escapeHTML(data.download_url)}" class="w-full bg-green-600 hover:bg-green-700 py-3 rounded-lg font-bold text-center block transition flex items-center justify-center gap-2">
+                    <a href="${escapeHTML(proxyDownloadUrl)}" 
+                       target="_blank" 
+                       rel="noopener noreferrer"
+                       class="w-full bg-green-600 hover:bg-green-700 py-3 rounded-lg font-bold text-center block transition flex items-center justify-center gap-2 no-underline text-white"
+                       id="btn-download-media">
                         <i data-lucide="download"></i> Download No-Watermark MP4
-                    </button>
+                    </a>
                 </div>
             </div>
         </div>
     `;
     lucide.createIcons();
-
-    // Attach click listener for direct download
-    document.getElementById('btn-download-media').addEventListener('click', function() {
-        const videoUrl = this.getAttribute('data-url');
-        downloadVideoFile(videoUrl, this);
-    });
 }
 
 async function handleBulkExtract() {
