@@ -130,8 +130,51 @@ async function handleSingleDownload() {
 }
 
 /**
+ * Triggers a real browser file save dialog by fetching the proxy stream 
+ * as a Blob and creating an in-memory object URL.
+ */
+async function downloadFileViaBlob(proxyUrl, defaultFilename, btnElement) {
+    const originalText = btnElement.innerHTML;
+    try {
+        // Show loading state on the button
+        btnElement.style.pointerEvents = 'none';
+        btnElement.innerHTML = `<i data-lucide="loader-2" class="w-5 h-5 animate-spin"></i> Downloading...`;
+        lucide.createIcons();
+
+        // 1. Fetch the video stream from our FastAPI backend proxy
+        const response = await fetch(proxyUrl);
+        if (!response.ok) {
+            throw new Error(`Server returned HTTP ${response.status}`);
+        }
+
+        // 2. Convert incoming video bytes into a local Blob
+        const blob = await response.blob();
+        const blobUrl = window.URL.createObjectURL(blob);
+
+        // 3. Programmatically create a hidden link and click it
+        const tempLink = document.createElement('a');
+        tempLink.href = blobUrl;
+        tempLink.download = defaultFilename;
+        document.body.appendChild(tempLink);
+        tempLink.click();
+
+        // 4. Clean up the object URL and remove element
+        window.URL.revokeObjectURL(blobUrl);
+        document.body.removeChild(tempLink);
+    } catch (err) {
+        console.error("Download failed:", err);
+        alert("Failed to download video. Please try again.");
+    } finally {
+        // Restore button state
+        btnElement.style.pointerEvents = 'auto';
+        btnElement.innerHTML = originalText;
+        lucide.createIcons();
+    }
+}
+
+/**
  * Renders the single video result and routes the download through our proxy
- * endpoint to trigger the browser's native file download prompt.
+ * endpoint using a Blob trigger to ensure the browser prompts the save dialog.
  */
 function renderSingleResult(data) {
     elements.results.classList.remove('hidden');
@@ -143,7 +186,7 @@ function renderSingleResult(data) {
         .slice(0, 30);
     const fileName = `${cleanTitle}.mp4`;
     
-    // Construct the backend proxy URL that forces file attachment
+    // Construct the backend proxy URL that streams the file
     const proxyDownloadUrl = `${API_BASE_URL}/proxy-download?url=${encodeURIComponent(data.download_url)}&filename=${encodeURIComponent(fileName)}`;
     
     elements.results.innerHTML = `
@@ -163,17 +206,24 @@ function renderSingleResult(data) {
                     </div>
                 </div>
                 <div class="space-y-3">
-                    <a href="${escapeHTML(proxyDownloadUrl)}" 
-                       download="${escapeHTML(fileName)}"
-                       class="w-full bg-green-600 hover:bg-green-700 py-3 rounded-lg font-bold text-center block transition flex items-center justify-center gap-2 no-underline text-white"
-                       id="btn-download-media">
+                    <button type="button" 
+                            class="w-full bg-green-600 hover:bg-green-700 py-3 rounded-lg font-bold text-center transition flex items-center justify-center gap-2 text-white cursor-pointer"
+                            id="btn-download-media">
                         <i data-lucide="download"></i> Download No-Watermark MP4
-                    </a>
+                    </button>
                 </div>
             </div>
         </div>
     `;
     lucide.createIcons();
+
+    // Attach event listener to trigger download via Blob
+    const downloadBtn = document.getElementById('btn-download-media');
+    if (downloadBtn) {
+        downloadBtn.addEventListener('click', () => {
+            downloadFileViaBlob(proxyDownloadUrl, fileName, downloadBtn);
+        });
+    }
 }
 
 async function handleBulkExtract() {

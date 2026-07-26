@@ -15,8 +15,6 @@ import yt_dlp
 # CONFIGURATION & PROXY SETUP
 # =====================================================================
 
-# You mentioned disabling this, but we leave the env read in case you 
-# re-enable it for yt-dlp metadata extraction in the future.
 DATAIMPULSE_PROXY = os.getenv("PROXY_URL")
 
 app = FastAPI(
@@ -291,7 +289,7 @@ async def health_check():
 async def proxy_download(url: str, filename: Optional[str] = "tiktok_video.mp4"):
     """
     Proxies video bytes directly from TikTok CDN with required headers
-    to trigger a native browser download prompt.
+    so the frontend fetch() call can construct a downloadable Blob object.
     """
     if not url or url.strip() == '' or url == 'none':
         raise HTTPException(
@@ -299,12 +297,12 @@ async def proxy_download(url: str, filename: Optional[str] = "tiktok_video.mp4")
             detail="Missing or invalid download URL."
         )
 
-    # TikTok CDN strictly checks for these headers or it rejects the request
+    # TikTok CDN strictly requires these headers to avoid 403 blocks
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
         "Referer": "https://www.tiktok.com/",
         "Accept": "*/*",
-        "Accept-Encoding": "identity",  # Ensure uncompressed video chunks
+        "Accept-Encoding": "identity",
     }
 
     async def video_stream():
@@ -315,7 +313,7 @@ async def proxy_download(url: str, filename: Optional[str] = "tiktok_video.mp4")
                         status_code=response.status_code, 
                         detail=f"TikTok CDN returned status code {response.status_code}"
                     )
-                async for chunk in response.aiter_bytes(chunk_size=1024 * 1024):  # 1MB chunks
+                async for chunk in response.aiter_bytes(chunk_size=1024 * 1024):  # 1MB Chunks
                     yield chunk
 
     encoded_filename = quote(filename)
