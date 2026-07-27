@@ -28,6 +28,16 @@ from utils.formatters import (
 
 logger = logging.getLogger(__name__)
 
+# ─── Global cache for yt-dlp resolved headers ─────────────────────
+# When we extract a video, yt-dlp resolves the correct headers needed
+# to access TikTok's CDN. We cache them so the proxy endpoint can use them.
+_header_cache: dict[str, dict] = {}
+
+
+def get_yt_dlp_headers(video_url: str) -> dict:
+    """Return cached yt-dlp headers for a given video URL, or empty dict."""
+    return _header_cache.get(video_url, {})
+
 
 # ─── Shared yt-dlp options ────────────────────────────────────────
 
@@ -57,6 +67,11 @@ def _run_yt_dlp_blocking(url: str, ydl_opts: dict) -> Optional[dict]:
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         try:
             info = ydl.extract_info(url, download=False)
+            # Cache the resolved HTTP headers that yt-dlp used
+            _header_cache[url] = dict(ydl._download_retcode if hasattr(ydl, '_download_retcode') else {})
+            # Try to get headers from the response info
+            if info and hasattr(info, "http_headers"):
+                _header_cache[url] = dict(info.http_headers)
             return info
         except yt_dlp.utils.DownloadError as e:
             logger.warning("yt-dlp DownloadError for %s: %s", url, e)
@@ -89,14 +104,14 @@ async def extract_single_video(url: str) -> dict[str, Any]:
     info = await asyncio.to_thread(_run_yt_dlp_blocking, url, ydl_opts)
 
     if info and _info_has_video_data(info):
-        return _normalise_single_info(info)
+        return _normalise_single_info(info, url)
 
     # Fallback: try httpx scraping
     logger.info("yt-dlp could not resolve %s, trying httpx fallback", url)
     info = await _fallback_single_extract(url)
 
     if info and _info_has_video_data(info):
-        return _normalise_single_info(info)
+        return _normalise_single_info(info, url)
 
     raise RuntimeError(
         "Could not extract video information. The video may be private, deleted, or the region is restricted."
@@ -133,7 +148,6 @@ async def _fallback_single_extract(url: str) -> Optional[dict]:
             resp.raise_for_status()
             html = resp.text
 
-        # Try to extract the download URL from TikTok's embedded JSON
         # Pattern 1: __UNIVERSAL_DATA_FOR_REHYDRATION__
         match = re.search(
             r'<script\s+id="__UNIVERSAL_DATA_FOR_REHYDRATION__"[^>]*>\s*(\{.+?)\s*</script>',
@@ -228,7 +242,6 @@ def _parse_sigi_state(data: dict) -> Optional[dict]:
         item_module = data.get("ItemModule", {})
         if not item_module:
             return None
-        # Get the first (and usually only) video item
         item_key = next(iter(item_module.keys()))
         item = item_module[item_key]
 
@@ -253,22 +266,19 @@ def _parse_sigi_state(data: dict) -> Optional[dict]:
 def _parse_ssr_data(data: dict) -> Optional[dict]:
     """Parse TikTok's SSR_HYDRATED_DATA embedded JSON."""
     try:
-        # Navigate SSR data structure
         detail = data.get("__DEFAULT_SCOPE__", {}).get("webapp.video-detail", {})
         item_info = detail.get("itemInfo", {}).get("itemStruct", {})
         if not item_info:
             return None
-
         return _parse_universal_data(data)
     except (KeyError, TypeError):
         return None
 
 
-def _normalise_single_info(info: dict) -> dict:
+def _normalise_single_info(info: dict, original_url: str = "") -> dict:
     """
     Normalise raw yt-dlp (or fallback) output into the shape expected by the frontend.
     """
-    # Determine the best download URL
     download_url = _pick_download_url(info)
     if not download_url:
         download_url = info.get("webpage_url", info.get("url", ""))
@@ -362,7 +372,6 @@ def _normalise_bulk_info(info: dict, username: str) -> dict:
 async def _fallback_bulk_extract(username: str) -> Optional[dict]:
     """
     Fallback bulk extraction using httpx scraping.
-    Scrapes the profile page and attempts to parse embedded JSON data.
     """
     try:
         async with httpx.AsyncClient(
@@ -445,7 +454,6 @@ async def _fallback_bulk_extract(username: str) -> Optional[dict]:
 
 def _normalise_bulk_entry(entry: dict) -> dict:
     """Normalise a single entry from yt-dlp bulk output."""
-    # Try multiple paths for view count
     view_count = entry.get("view_count", 0)
     if not view_count:
         stats = entry.get("stats", {})

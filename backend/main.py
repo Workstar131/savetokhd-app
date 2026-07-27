@@ -8,16 +8,15 @@ Endpoints:
   GET  /api/health            — Health check
   POST /api/download-single   — Extract single video metadata
   POST /api/extract-bulk      — Extract bulk profile metadata
-  GET  /api/proxy-download    — Stream a video from TikTok CDN via server proxy
+  GET  /api/proxy-download    — Redirect to TikTok CDN video URL
 """
 
 import logging
 from urllib.parse import urlparse
 
-import httpx
-from fastapi import FastAPI, HTTPException, Query, Request
+from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.responses import JSONResponse, RedirectResponse
 
 from config import settings
 from schemas.payload_models import (
@@ -50,7 +49,6 @@ app = FastAPI(
 # ─── CORS Middleware ──────────────────────────────────────────────
 
 if settings.CORS_ALLOW_ALL:
-    # Allow all origins (for debugging / open access)
     app.add_middleware(
         CORSMiddleware,
         allow_origins=["*"],
@@ -61,7 +59,6 @@ if settings.CORS_ALLOW_ALL:
         max_age=600,
     )
 else:
-    # Explicit origins list for production
     app.add_middleware(
         CORSMiddleware,
         allow_origins=settings.CORS_ORIGINS,
@@ -172,13 +169,18 @@ async def extract_bulk(request: BulkExtractRequest):
 
 
 @app.get("/api/proxy-download", tags=["Download"])
-async def proxy_download(url: str = Query(..., description="Encoded TikTok CDN video URL")):
+async def proxy_download(
+    url: str = Query(..., description="Encoded TikTok CDN video URL"),
+):
     """
-    Proxy a video download from TikTok's CDN.
+    Redirect the browser to the TikTok CDN video URL for download.
 
-    Streams the video through this server with spoofed headers so that
-    TikTok's CDN accepts the request. Uses StreamingResponse to keep
-    server memory usage low.
+    The CDN URL already contains temporary authentication tokens/signatures
+    that are valid for a limited time. By returning a 302 redirect, the
+    browser accesses the CDN directly — no server proxy needed.
+
+    This avoids the 403 Forbidden error that occurs when the server tries
+    to proxy the request without the proper yt-dlp resolved cookies/headers.
     """
     if not url:
         raise HTTPException(status_code=400, detail="Missing 'url' parameter.")
@@ -186,8 +188,12 @@ async def proxy_download(url: str = Query(..., description="Encoded TikTok CDN v
     # Validate that the URL points to a TikTok-related domain
     try:
         parsed = urlparse(url)
-        allowed_domains = ("tiktok.com", "tiktokcdn.com", "tiktokv.com")
-        if not any(parsed.hostname and d in parsed.hostname for d in allowed_domains):
+        allowed_domains = (
+            "tiktok.com", "tiktokcdn.com", "tiktokv.com",
+            "byteoversea.com", "bytegecko-i18n.com",
+        )
+        hostname = parsed.hostname or ""
+        if not any(d in hostname for d in allowed_domains):
             raise HTTPException(
                 status_code=400,
                 detail="URL must point to a TikTok CDN or video domain.",
@@ -197,27 +203,13 @@ async def proxy_download(url: str = Query(..., description="Encoded TikTok CDN v
     except Exception:
         raise HTTPException(status_code=400, detail="Invalid URL format.")
 
-    headers = {
-        "User-Agent": settings.DEFAULT_USER_AGENT,
-        "Referer": settings.DEFAULT_REFERER,
-        "Accept": "*/*",
-        "Accept-Encoding": "identity",  # Prevent gzip to stream raw bytes
-        "Accept-Language": "en-US,en;q=0.9",
-    }
-
-    async def stream_content():
-        async with httpx.AsyncClient(follow_redirects=True, timeout=60.0) as client:
-            async with client.stream("GET", url, headers=headers) as response:
-                response.raise_for_status()
-                async for chunk in response.aiter_bytes(chunk_size=settings.PROXY_CHUNK_SIZE):
-                    yield chunk
-
-    return StreamingResponse(
-        stream_content(),
-        media_type="video/mp4",
+    # Return a 302 redirect so the browser downloads directly from the CDN
+    logger.info("Redirecting to CDN: %s", url[:100])
+    return RedirectResponse(
+        url=url,
+        status_code=302,
         headers={
             "Content-Disposition": 'attachment; filename="tiktok_video_nowatermark.mp4"',
-            "Cache-Control": "no-cache",
         },
     )
 
