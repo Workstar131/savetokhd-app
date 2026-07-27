@@ -168,7 +168,7 @@ async def extract_bulk(request: BulkExtractRequest):
         )
 
 
-@app.get("/api/proxy-download", tags=["Download"])
+@app.api_route("/api/proxy-download", methods=["GET", "HEAD"], tags=["Download"])
 async def proxy_download(
     url: str = Query(..., description="Encoded TikTok CDN video URL"),
 ):
