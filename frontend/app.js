@@ -137,13 +137,15 @@ async function handleSingleDownload() {
 function renderSingleResult(data) {
     elements.results.classList.remove('hidden');
     
-    // Build the proxy-download URL (server does 302 redirect to TikTok CDN)
-    const proxyDownloadUrl = `${API_BASE_URL}/proxy-download?url=${encodeURIComponent(data.download_url)}`;
+    // Use the CDN URL directly — no server-side redirect needed.
+    // The CDN URL already contains temporary auth tokens/signatures
+    // and is accessed directly by the browser.
+    const directDownloadUrl = data.download_url;
     
     elements.results.innerHTML = `
         <div class="bg-gray-900 border border-gray-700 rounded-xl overflow-hidden flex flex-col md:flex-row">
             <div class="md:w-1/3 relative group">
-                <img src="${escapeHTML(data.thumbnail)}" alt="Preview" class="w-full h-full object-cover">
+                <img src="${escapeHTML(data.thumbnail)}" alt="Preview" class="w-full h-full object-cover" onerror="this.style.display='none'">
                 <div class="absolute inset-0 bg-black/40 flex items-center justify-center opacity-0 group-hover:opacity-100 transition">
                     <i data-lucide="play-circle" class="w-12 h-12 text-white"></i>
                 </div>
@@ -157,18 +159,39 @@ function renderSingleResult(data) {
                     </div>
                 </div>
                 <div class="space-y-3">
-                    <a href="${escapeHTML(proxyDownloadUrl)}" 
-                       target="_blank" 
-                       rel="noopener noreferrer"
-                       class="w-full bg-green-600 hover:bg-green-700 py-3 rounded-lg font-bold text-center block transition flex items-center justify-center gap-2 no-underline text-white"
-                       id="btn-download-media">
+                    <button id="btn-download-media"
+                       class="w-full bg-green-600 hover:bg-green-700 py-3 rounded-lg font-bold text-center block transition flex items-center justify-center gap-2 no-underline text-white cursor-pointer border-0">
                         <i data-lucide="download"></i> Download No-Watermark MP4
-                    </a>
+                    </button>
                 </div>
             </div>
         </div>
     `;
     lucide.createIcons();
+    
+    // Attach download handler that opens the CDN URL directly
+    const downloadBtn = document.getElementById('btn-download-media');
+    downloadBtn.addEventListener('click', async () => {
+        try {
+            // Fetch the CDN URL and trigger a download via blob
+            const resp = await fetch(directDownloadUrl);
+            const blob = await resp.blob();
+            const blobUrl = URL.createObjectURL(blob);
+            const a = document.createElement('a');
+            a.href = blobUrl;
+            a.download = 'tiktok_video_nowatermark.mp4';
+            a.style.display = 'none';
+            document.body.appendChild(a);
+            a.click();
+            setTimeout(() => {
+                URL.revokeObjectURL(blobUrl);
+                document.body.removeChild(a);
+            }, 100);
+        } catch (err) {
+            // Fallback: open directly in new tab if CORS blocks blob fetch
+            window.open(directDownloadUrl, '_blank', 'noopener,noreferrer');
+        }
+    });
 }
 
 async function handleBulkExtract() {
