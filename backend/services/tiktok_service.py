@@ -101,56 +101,13 @@ def url_candidates(tiktok_url: str) -> list:
     return candidates
 
 
-def _select_video_plus_audio_url(urls: list) -> str:
-    """
-    From a list of candidate URLs returned by TikWM, select the one that
-    most likely contains both video AND audio (not audio-only).
-
-    TikWM can return multiple URL entries:
-      - Some URLs are video+audio combined (e.g. mp4 with both streams)
-      - Some URLs are audio-only (e.g. .mp3 or audio codec only)
-      - Some URLs may have query params indicating format
-
-    Heuristics:
-      1. URLs containing 'video' or '.mp4' in the path/query are preferred
-      2. URLs containing 'audio' or '.mp3' or 'audio_only' are deprioritized
-      3. If all URLs look like video URLs, prefer the longest URL (more params)
-    """
-    if not urls:
-        return ""
-
-    video_candidates = []
-    audio_candidates = []
-
-    for u in urls:
-        lower = u.lower()
-        if ("audio" in lower or ".mp3" in lower or "audio_only" in lower
-                or "music" in lower):
-            audio_candidates.append(u)
-        else:
-            video_candidates.append(u)
-
-    # Prefer video candidates; if none found, fall back to audio (better than nothing)
-    candidates = video_candidates if video_candidates else audio_candidates
-    if not candidates:
-        return urls[0] if urls else ""
-
-    # Among video candidates, prefer URLs with video-specific indicators
-    for u in candidates:
-        lower = u.lower()
-        if "video" in lower or ".mp4" in lower:
-            return u
-
-    # If no clear video indicator, return the first video candidate
-    return candidates[0]
-
-
 # ─── TikWM API ────────────────────────────────────────────────────
 
 def _submit_tikwm_task(url: str) -> Optional[dict]:
     """
     Submit a TikTok URL to TikWM and poll for the result.
-    Returns a dict with play_url, author info, and metadata, or None on failure.
+    Returns a dict with play_url, thumbnail, author info, and metadata,
+    or None on failure.
     """
     candidates = url_candidates(url)
     username_from_url = "unknown"
@@ -187,40 +144,38 @@ def _submit_tikwm_task(url: str) -> Optional[dict]:
 
                     if status == 2:  # Ready
                         detail = result_data.get("detail") or result_data
-                        # Collect all possible video URLs from the response
-                        all_urls = []
-                        # Check for nested video URLs array (common in TikWM)
-                        video_urls = detail.get("video_urls") or detail.get("videoUrl") or []
-                        if isinstance(video_urls, list):
-                            for v in video_urls:
-                                if isinstance(v, dict):
-                                    u = v.get("play_url") or v.get("url") or v.get("play")
-                                    if u:
-                                        all_urls.append(u)
-                                elif isinstance(v, str) and v:
-                                    all_urls.append(v)
-                        # Also check top-level fields
-                        for key in ("play_url", "url", "play"):
-                            u = detail.get(key) or result_data.get(key)
-                            if u and isinstance(u, str) and u not in all_urls:
-                                all_urls.append(u)
-                        # If we have an audio-only URL list, prefer video+audio
-                        audio_urls = detail.get("audio_url") or detail.get("audioUrl") or []
-                        if isinstance(audio_urls, list):
-                            for au in audio_urls:
-                                au_str = au if isinstance(au, str) else au.get("url", "") if isinstance(au, dict) else ""
-                                if au_str and au_str in all_urls:
-                                    # Mark this as audio-only candidate to deprioritize
-                                    pass  # We'll filter below
-                        # Select the best URL: prefer URLs that contain video indicators
-                        video_url = _select_video_plus_audio_url(all_urls)
-                        play_url = video_url
-                        author = detail.get("author") or result_data.get("author") or {}
-                        username = (
-                            author.get("unique_id")
-                            or author.get("nickname")
-                            or "unknown"
+
+                        # ── Extract play_url (video + audio muxed) ──
+                        play_url = (
+                            detail.get("play_url")
+                            or detail.get("url")
+                            or detail.get("play")
+                            or result_data.get("play_url")
+                            or result_data.get("url")
                         )
+
+                        # ── Extract thumbnail / cover ──
+                        cover = (
+                            detail.get("cover")
+                            or detail.get("origin_cover")
+                            or detail.get("dynamic_cover")
+                            or result_data.get("cover")
+                            or result_data.get("origin_cover")
+                            or result_data.get("dynamic_cover")
+                            or ""
+                        )
+
+                        # ── Extract author info ──
+                        author = detail.get("author") or result_data.get("author") or {}
+                        if isinstance(author, dict):
+                            username = (
+                                author.get("unique_id")
+                                or author.get("nickname")
+                                or "unknown"
+                            )
+                        else:
+                            username = author or "unknown"
+
                         vid = (
                             detail.get("video_id")
                             or result_data.get("video_id")
@@ -244,27 +199,33 @@ def _submit_tikwm_task(url: str) -> Optional[dict]:
                         )
                         images = detail.get("images") or result_data.get("images") or []
 
+                        # ── Extract stats (views, likes, etc.) ──
+                        stats = detail.get("stats") or result_data.get("stats") or {}
+                        view_count = (
+                            stats.get("play_count")
+                            or stats.get("playCount")
+                            or stats.get("view_count")
+                            or detail.get("view_count")
+                            or result_data.get("view_count")
+                            or 0
+                        )
+                        duration = (
+                            detail.get("duration")
+                            or result_data.get("duration")
+                            or 0
+                        )
+
                         if play_url:
-                            # Extract thumbnail from response
-                            cover = (
-                                detail.get("cover")
-                                or detail.get("origin_cover")
-                                or detail.get("dynamic_cover")
-                                or detail.get("cover_url")
-                                or result_data.get("cover")
-                                or result_data.get("origin_cover")
-                                or ""
-                            )
                             return {
                                 "play_url": play_url,
+                                "cover": cover,
                                 "username": username,
                                 "video_id": vid,
                                 "create_time": create_time,
                                 "desc": desc,
                                 "images": images if isinstance(images, list) else [],
-                                "cover": cover,
-                                "origin_cover": detail.get("origin_cover") or result_data.get("origin_cover") or "",
-                                "dynamic_cover": detail.get("dynamic_cover") or result_data.get("dynamic_cover") or "",
+                                "view_count": int(view_count) if view_count else 0,
+                                "duration": int(duration) if duration else 0,
                             }
                     elif status == 3:  # Failed
                         break
@@ -279,21 +240,34 @@ def _submit_tikwm_task(url: str) -> Optional[dict]:
     return None
 
 
+def _pick_best_tikwm_url(detail: dict) -> str:
+    """
+    Select the best video URL from TikWM detail dict.
+    Prioritise video+audio muxed formats over audio-only.
+    """
+    # play_url is already the best (muxed) URL from TikWM
+    play_url = (
+        detail.get("play_url")
+        or detail.get("url")
+        or detail.get("play")
+    )
+    if play_url:
+        return play_url
+
+    # Fallback: check music field and avoid it
+    music = detail.get("music") or {}
+    music_url = music.get("play_url") or music.get("play") or ""
+
+    return music_url
+
+
 def _tikwm_single_result_to_schema(result: dict) -> dict:
     """Convert TikWM single video result to the SingleVideoResponse schema."""
-    # TikWM response includes thumbnail in several possible fields
-    thumbnail = (
-        result.get("cover")
-        or result.get("origin_cover")
-        or result.get("dynamic_cover")
-        or result.get("cover_url")
-        or ""
-    )
     return {
         "title": safe_caption(result.get("desc", "")),
         "author": f"@{result.get('username', 'unknown')}",
-        "views": "0",
-        "thumbnail": thumbnail,
+        "views": format_views(result.get("view_count", 0)),
+        "thumbnail": result.get("cover", ""),
         "download_url": result.get("play_url", ""),
     }
 
@@ -496,57 +470,46 @@ def _normalise_single_info(info: dict, original_url: str = "") -> dict:
 
 
 def _pick_download_url(info: dict) -> str:
-    """Select the best available video+audio URL from yt-dlp output."""
+    """
+    Select the best available video URL from yt-dlp output.
+    Filters out audio-only formats to ensure video+audio is returned.
+    """
     formats = info.get("formats", []) or []
 
-    # Separate video+audio formats from audio-only formats
-    video_audio_formats = []
-    audio_only_formats = []
-    for f in formats:
-        codec = (f.get("vcodec", "") or "").lower()
-        acodec = (f.get("acodec", "") or "").lower()
-        height = f.get("height") or 0
-        # A format has video if it has a non-"none" vcodec and a height
-        has_video = codec and codec != "none" and height > 0
-        has_audio = acodec and acodec != "none"
-        if has_video and has_audio:
-            video_audio_formats.append(f)
-        elif has_video:
-            # Video without audio — still usable as fallback
-            video_audio_formats.append(f)
-        else:
-            audio_only_formats.append(f)
+    def _is_muxed(fmt: dict) -> bool:
+        """Check if format has both video and audio (muxed)."""
+        vcodec = (fmt.get("vcodec") or "").lower()
+        acodec = (fmt.get("acodec") or "").lower()
+        height = fmt.get("height") or 0
+        # Audio-only: has acodec but no video (no vcodec or vcodec is 'none')
+        is_audio_only = (
+            acodec
+            and acodec not in ("none", "")
+            and (not vcodec or vcodec in ("none", ""))
+            and not height
+        )
+        return not is_audio_only
 
-    # Sort video+audio formats by quality (height, vbr)
-    sorted_video_formats = sorted(
-        video_audio_formats,
+    # Filter to muxed (video+audio) formats only
+    muxed_formats = [f for f in formats if _is_muxed(f)]
+    if not muxed_formats:
+        # If no muxed formats, fall back to all formats
+        muxed_formats = formats
+
+    sorted_formats = sorted(
+        muxed_formats,
         key=lambda f: (f.get("height", 0) or 0, f.get("vbr", 0) or 0),
         reverse=True,
     )
 
-    # Look for TikTok-specific no-watermark URLs first (these are always video+audio)
-    for fmt in sorted_video_formats:
+    # Look for TikTok-specific no-watermark URLs first
+    for fmt in sorted_formats:
         url = fmt.get("url", "")
         if url and ("no_watermark" in url.lower() or "play_addr" in url.lower()):
             return url
 
-    # Next: look for no-watermark in ALL formats (including audio-only) — but only as last resort
-    all_sorted = sorted(
-        formats, key=lambda f: (f.get("height", 0) or 0, f.get("vbr", 0) or 0), reverse=True
-    )
-    for fmt in all_sorted:
-        url = fmt.get("url", "")
-        if url and ("no_watermark" in url.lower() or "play_addr" in url.lower()):
-            return url
-
-    # Fallback: use the best video+audio format URL
-    for fmt in sorted_video_formats:
-        url = fmt.get("url", "")
-        if url:
-            return url
-
-    # Last resort: audio-only
-    for fmt in audio_only_formats:
+    # Fallback: use the best quality muxed format URL
+    for fmt in sorted_formats:
         url = fmt.get("url", "")
         if url:
             return url
@@ -600,8 +563,8 @@ async def extract_bulk_profile(username_raw: str, delay: float = 1.0) -> dict:
         if tikwm_result and tikwm_result.get("play_url"):
             videos.append({
                 "caption": safe_caption(vid_data.get("desc", tikwm_result.get("desc", ""))),
-                "views": format_views(vid_data.get("view_count", 0)),
-                "duration": format_duration(vid_data.get("duration", 0)),
+                "views": format_views(vid_data.get("view_count", tikwm_result.get("view_count", 0))),
+                "duration": format_duration(vid_data.get("duration", tikwm_result.get("duration", 0))),
                 "url": tikwm_result.get("play_url", video_url),
             })
         else:
