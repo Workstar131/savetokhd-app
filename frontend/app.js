@@ -130,22 +130,23 @@ async function handleSingleDownload() {
 }
 
 /**
- * Renders the single video result with an <a> tag download link.
- * Uses a real hyperlink (not a button) so the browser treats it as a trusted
- * navigation and never blocks it as a popup.
+ * Renders the single video result with a download button.
+ * Uses the CDN URL directly with a click handler that triggers
+ * a proper browser download (avoids redirect to Render site).
  */
 function renderSingleResult(data) {
     elements.results.classList.remove('hidden');
     
-    // Use the CDN URL directly — no server-side redirect needed.
-    // The CDN URL already contains temporary auth tokens/signatures
-    // and is accessed directly by the browser.
-    const directDownloadUrl = data.download_url;
+    // Store the download URL in a data attribute for the click handler
+    const downloadUrl = data.download_url;
     
     elements.results.innerHTML = `
         <div class="bg-gray-900 border border-gray-700 rounded-xl overflow-hidden flex flex-col md:flex-row">
             <div class="md:w-1/3 relative group">
-                <img src="${escapeHTML(data.thumbnail)}" alt="Preview" class="w-full h-full object-cover" onerror="this.style.display='none'">
+                <img src="${escapeHTML(data.thumbnail || '')}" 
+                     alt="Preview" 
+                     class="w-full h-full object-cover"
+                     onerror="this.src='data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 400 300%22><rect fill=%22%231a1a2e%22 width=%22400%22 height=%22300%22/><text fill=%22%23666%22 font-size=%2220%22 x=%2250%25%22 y=%2250%25%22 text-anchor=%22middle%22>No Preview</text></svg>'">
                 <div class="absolute inset-0 bg-black/40 flex items-center justify-center opacity-0 group-hover:opacity-100 transition">
                     <i data-lucide="play-circle" class="w-12 h-12 text-white"></i>
                 </div>
@@ -160,7 +161,9 @@ function renderSingleResult(data) {
                 </div>
                 <div class="space-y-3">
                     <button id="btn-download-media"
-                       class="w-full bg-green-600 hover:bg-green-700 py-3 rounded-lg font-bold text-center block transition flex items-center justify-center gap-2 no-underline text-white cursor-pointer border-0">
+                            data-download-url="${escapeHTML(downloadUrl)}"
+                            data-filename="${escapeHTML(sanitizeFilename(data.title))}"
+                            class="w-full bg-green-600 hover:bg-green-700 py-3 rounded-lg font-bold text-center transition flex items-center justify-center gap-2 text-white cursor-pointer">
                         <i data-lucide="download"></i> Download No-Watermark MP4
                     </button>
                 </div>
@@ -169,29 +172,26 @@ function renderSingleResult(data) {
     `;
     lucide.createIcons();
     
-    // Attach download handler that opens the CDN URL directly
+    // Attach click handler for proper download
     const downloadBtn = document.getElementById('btn-download-media');
-    downloadBtn.addEventListener('click', async () => {
-        try {
-            // Fetch the CDN URL and trigger a download via blob
-            const resp = await fetch(directDownloadUrl);
-            const blob = await resp.blob();
-            const blobUrl = URL.createObjectURL(blob);
-            const a = document.createElement('a');
-            a.href = blobUrl;
-            a.download = 'tiktok_video_nowatermark.mp4';
-            a.style.display = 'none';
-            document.body.appendChild(a);
-            a.click();
-            setTimeout(() => {
-                URL.revokeObjectURL(blobUrl);
-                document.body.removeChild(a);
-            }, 100);
-        } catch (err) {
-            // Fallback: open directly in new tab if CORS blocks blob fetch
-            window.open(directDownloadUrl, '_blank', 'noopener,noreferrer');
-        }
-    });
+    if (downloadBtn) {
+        downloadBtn.addEventListener('click', (e) => {
+            e.preventDefault();
+            const videoUrl = downloadBtn.getAttribute('data-download-url');
+            if (!videoUrl) {
+                alert('No download URL available.');
+                return;
+            }
+            // Use the backend proxy endpoint which does a 302 redirect
+            // The redirect bypasses the browser's popup blocker since it's a same-origin request
+            window.location.href = `${API_BASE_URL}/proxy-download?url=${encodeURIComponent(videoUrl)}`;
+        });
+    }
+}
+
+function sanitizeFilename(text) {
+    if (!text) return "tiktok_video";
+    return text.replace(/[^a-zA-Z0-9_-]/g, '_').substring(0, 64) + ".mp4";
 }
 
 async function handleBulkExtract() {
