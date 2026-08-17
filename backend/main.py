@@ -19,7 +19,7 @@ from typing import Optional
 import httpx
 from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.responses import JSONResponse, StreamingResponse, RedirectResponse
 
 from config import settings
 from schemas.payload_models import (
@@ -362,9 +362,15 @@ async def proxy_download(
             break
     
     if working_url is None:
-        raise HTTPException(
-            status_code=502,
-            detail="Failed to connect to video source. The CDN link may have expired or is blocked. Please try extracting the video again.",
+        # Server IP is blocked by TikTok CDN, but the user's browser (residential IP)
+        # is NOT blocked. Redirect the browser directly to the CDN URL — the browser
+        # can access it even when the server cannot.
+        logger.info("Server blocked from all CDN domains, redirecting browser directly to: %s", url[:80])
+        # Add headers to encourage download instead of inline play
+        return RedirectResponse(
+            url=url,
+            status_code=302,
+            headers={"Content-Disposition": f'attachment; filename="{filename}"'},
         )
     
     if working_url != url:
