@@ -145,7 +145,13 @@ def _submit_tikwm_task(url: str) -> Optional[dict]:
                     if status == 2:  # Ready
                         detail = result_data.get("detail") or result_data
 
-                        # ── Extract play_url (video + audio muxed) ──
+                        # ── Extract video URL ──
+                        # Prefer hdplay (tokcdn.com - server accessible) over play_url (webapp-prime - blocks server IPs)
+                        hdplay = (
+                            detail.get("hdplay")
+                            or result_data.get("hdplay")
+                            or ""
+                        )
                         play_url = (
                             detail.get("play_url")
                             or detail.get("url")
@@ -153,6 +159,9 @@ def _submit_tikwm_task(url: str) -> Optional[dict]:
                             or result_data.get("play_url")
                             or result_data.get("url")
                         )
+                        # Use hdplay if available (tokcdn.com CDN is accessible from servers)
+                        # Fall back to play_url if hdplay is not available
+                        final_url = hdplay or play_url
 
                         # ── Extract thumbnail / cover ──
                         cover = (
@@ -215,9 +224,9 @@ def _submit_tikwm_task(url: str) -> Optional[dict]:
                             or 0
                         )
 
-                        if play_url:
+                        if final_url:
                             return {
-                                "play_url": play_url,
+                                "play_url": final_url,
                                 "cover": cover,
                                 "username": username,
                                 "video_id": vid,

@@ -294,8 +294,14 @@ async def proxy_download(
     
     stream_gen = _stream_video_from_cdn(url, filename)
     
-    # Get metadata from first yield
-    first_yield = await stream_gen.__anext__()
+    # Get metadata from first yield (handle StopAsyncIteration if generator is empty)
+    try:
+        first_yield = await stream_gen.__anext__()
+    except StopAsyncIteration:
+        raise HTTPException(
+            status_code=502,
+            detail="Failed to connect to video source. Please try extracting the video again.",
+        )
     
     if not isinstance(first_yield, dict) or not first_yield.get("_meta"):
         raise HTTPException(
