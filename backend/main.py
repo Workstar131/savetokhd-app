@@ -8,15 +8,17 @@ Endpoints:
   GET  /api/health            — Health check
   POST /api/download-single   — Extract single video metadata
   POST /api/extract-bulk      — Extract bulk profile metadata
-  GET  /api/proxy-download    — Redirect to TikTok CDN video URL
+  GET  /api/proxy-download    — Proxy-stream video from TikTok CDN
 """
 
+import asyncio
 import logging
 from urllib.parse import urlparse
 
-from fastapi import FastAPI, HTTPException, Query
+import httpx
+from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, RedirectResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 
 from config import settings
 from schemas.payload_models import (
@@ -105,9 +107,7 @@ async def health_check():
 async def download_single(request: SingleDownloadRequest):
     """
     Extract metadata for a single TikTok video.
-
-    Validates the URL, runs yt-dlp to parse video details without downloading,
-    and returns metadata including a watermark-free CDN download URL.
+    Returns metadata including a no-watermark CDN download URL.
     """
     url = request.url.strip()
 
@@ -142,9 +142,6 @@ async def download_single(request: SingleDownloadRequest):
 async def extract_bulk(request: BulkExtractRequest):
     """
     Extract metadata for all public videos on a TikTok profile.
-
-    Accepts a username (with or without @) and optional delay between requests.
-    Returns structured video metadata suitable for table display and CSV export.
     """
     username = request.username.strip()
     if not username:
@@ -168,19 +165,107 @@ async def extract_bulk(request: BulkExtractRequest):
         )
 
 
+# ─── Proxy Download (Server-side Streaming) ───────────────────────
+
+def _get_cdn_headers() -> dict:
+    """
+    Build browser-like headers that TikTok CDN accepts.
+    These mimic a real browser fetching a video from TikTok.
+    """
+    return {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/131.0.0.0 Safari/537.36"
+        ),
+        "Accept": "video/webm,video/ogg,video/*;q=0.9,application/ogg;q=0.7,audio/*;q=0.6,*/*;q=0.5",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Accept-Encoding": "identity",
+        "Referer": "https://www.tiktok.com/",
+        "Origin": "https://www.tiktok.com",
+        "Sec-Fetch-Dest": "video",
+        "Sec-Fetch-Mode": "no-cors",
+        "Sec-Fetch-Site": "cross-site",
+        "Range": "bytes=0-",
+    }
+
+
+async def _stream_video_from_cdn(url: str, filename: str):
+    """
+    Stream a video from the TikTok CDN through our server.
+    
+    This is a generator that yields chunks of video data as they arrive,
+    allowing the browser to start downloading immediately without waiting
+    for the full file to be downloaded server-side first.
+    """
+    headers = _get_cdn_headers()
+    
+    async with httpx.AsyncClient(
+        timeout=120.0,
+        follow_redirects=True,
+        headers=headers,
+    ) as client:
+        try:
+            async with client.stream("GET", url) as response:
+                if response.status_code in (403, 404):
+                    logger.error(
+                        "CDN rejected stream request: %d for %s",
+                        response.status_code, url[:80]
+                    )
+                    return
+                
+                if response.status_code != 200 and response.status_code != 206:
+                    logger.warning(
+                        "CDN returned %d for %s", response.status_code, url[:80]
+                    )
+                    return
+                
+                content_type = response.headers.get("content-type", "video/mp4")
+                content_length = response.headers.get("content-length", "")
+                
+                # Yield response metadata for the outer function
+                yield {
+                    "_meta": True,
+                    "content_type": content_type,
+                    "content_length": content_length,
+                    "status_code": response.status_code,
+                }
+                
+                # Stream chunks
+                chunk_count = 0
+                async for chunk in response.aiter_bytes(chunk_size=settings.PROXY_CHUNK_SIZE):
+                    chunk_count += 1
+                    yield chunk
+                    
+                logger.info(
+                    "Streamed %d chunks (%.1f MB) from CDN for %s",
+                    chunk_count,
+                    chunk_count * settings.PROXY_CHUNK_SIZE / (1024 * 1024),
+                    url[:60],
+                )
+                
+        except httpx.ConnectError:
+            logger.error("Connection error streaming from CDN: %s", url[:80])
+        except httpx.TimeoutException:
+            logger.error("Timeout streaming from CDN: %s", url[:80])
+        except Exception as e:
+            logger.error("Stream error: %s — %s", e, url[:80])
+
+
 @app.api_route("/api/proxy-download", methods=["GET", "HEAD"], tags=["Download"])
 async def proxy_download(
     url: str = Query(..., description="Encoded TikTok CDN video URL"),
 ):
     """
-    Redirect the browser to the TikTok CDN video URL for download.
-
-    The CDN URL already contains temporary authentication tokens/signatures
-    that are valid for a limited time. By returning a 302 redirect, the
-    browser accesses the CDN directly — no server proxy needed.
-
-    This avoids the 403 Forbidden error that occurs when the server tries
-    to proxy the request without the proper yt-dlp resolved cookies/headers.
+    Proxy-stream the video from TikTok CDN through our server.
+    
+    TikTok CDN URLs expire quickly and are session-dependent. Instead of
+    redirecting (which causes 0-byte downloads when the CDN rejects the
+    browser's request), we stream the video through our server using
+    browser-like headers that the CDN accepts.
+    
+    The browser receives the video data directly from our server with
+    proper Content-Disposition headers for download.
     """
     if not url:
         raise HTTPException(status_code=400, detail="Missing 'url' parameter.")
@@ -203,14 +288,47 @@ async def proxy_download(
     except Exception:
         raise HTTPException(status_code=400, detail="Invalid URL format.")
 
-    # Return a 302 redirect so the browser downloads directly from the CDN
-    logger.info("Redirecting to CDN: %s", url[:100])
-    return RedirectResponse(
-        url=url,
-        status_code=302,
-        headers={
-            "Content-Disposition": 'attachment; filename="tiktok_video_nowatermark.mp4"',
-        },
+    logger.info("Proxy-streaming video from: %s", url[:100])
+    
+    filename = "tiktok_video_nowatermark.mp4"
+    
+    stream_gen = _stream_video_from_cdn(url, filename)
+    
+    # Get metadata from first yield
+    first_yield = await stream_gen.__anext__()
+    
+    if not isinstance(first_yield, dict) or not first_yield.get("_meta"):
+        raise HTTPException(
+            status_code=502,
+            detail="Failed to connect to video source. Please try again.",
+        )
+    
+    content_type = first_yield.get("content_type", "video/mp4")
+    content_length = first_yield.get("content_length", "")
+    status_code = first_yield.get("status_code", 200)
+    
+    if status_code in (403, 404):
+        raise HTTPException(
+            status_code=502,
+            detail="Video source rejected the request. The CDN link may have expired. Please try extracting again.",
+        )
+    
+    async def video_stream():
+        async for chunk in stream_gen:
+            yield chunk
+    
+    response_headers = {
+        "Content-Disposition": f'attachment; filename="{filename}"',
+        "Content-Type": content_type,
+        "Accept-Ranges": "bytes",
+    }
+    if content_length:
+        response_headers["Content-Length"] = content_length
+    
+    return StreamingResponse(
+        video_stream(),
+        media_type=content_type,
+        headers=response_headers,
     )
 
 
