@@ -275,7 +275,7 @@ async def proxy_download(
         parsed = urlparse(url)
         allowed_domains = (
             "tiktok.com", "tiktokcdn.com", "tokcdn.com",
-            "tiktokv.com", "byteoversea.com", "bytegecko-i18n.com",
+            "tiktokcdn-us.com", "tiktokv.com", "byteoversea.com", "bytegecko-i18n.com",
         )
         hostname = parsed.hostname or ""
         if not any(d in hostname for d in allowed_domains):

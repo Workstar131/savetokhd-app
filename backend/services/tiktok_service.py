@@ -1,10 +1,9 @@
 """
 TikTok extraction service.
 
-Primary engine: TikWM API (https://tikwm.com) — a free no-watermark
-TikTok video extractor that works server-side without IP restrictions.
-
-Fallbacks: yt-dlp and httpx-based scraping when TikWM is unavailable.
+Primary engine: TikWM V2 API (https://tikwm.com/api/) — returns hdplay URLs
+from server-accessible CDN domains (tiktokcdn-us.com, tokcdn.com).
+Fallback: TikWM V1 task-based API for videos that V2 can't parse.
 
 All blocking calls are executed inside asyncio.to_thread so the
 FastAPI event loop stays non-blocking.
@@ -34,8 +33,12 @@ logger = logging.getLogger(__name__)
 
 # ─── TikWM API Configuration ──────────────────────────────────────
 
-TIKWM_SUBMIT_URL = "https://tikwm.com/api/video/task/submit"
-TIKWM_RESULT_BASE = "https://tikwm.com/api/video/task/result?task_id="
+# V2 API: Direct POST, returns result immediately (preferred)
+TIKWM_V2_URL = "https://tikwm.com/api/"
+# V1 API: Task-based submit + poll (fallback)
+TIKWM_V1_SUBMIT_URL = "https://tikwm.com/api/video/task/submit"
+TIKWM_V1_RESULT_BASE = "https://tikwm.com/api/video/task/result?task_id="
+
 TIKWM_HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:141.0) Gecko/20100101 Firefox/141.0",
     "Accept": "application/json, text/javascript, */*; q=0.01",
@@ -101,23 +104,86 @@ def url_candidates(tiktok_url: str) -> list:
     return candidates
 
 
-# ─── TikWM API ────────────────────────────────────────────────────
+# ─── TikWM V2 API (Primary) ───────────────────────────────────────
 
-def _submit_tikwm_task(url: str) -> Optional[dict]:
+def _submit_tikwm_v2(url: str) -> Optional[dict]:
     """
-    Submit a TikTok URL to TikWM and poll for the result.
-    Returns a dict with play_url, thumbnail, author info, and metadata,
-    or None on failure.
+    Submit to TikWM V2 API (direct POST, returns result immediately).
+    V2 reliably returns hdplay URLs from server-accessible CDN domains.
     """
     candidates = url_candidates(url)
-    username_from_url = "unknown"
+
+    for candidate in candidates:
+        try:
+            body = f"url={quote(candidate)}&hd=1"
+            with httpx.Client(timeout=TIKWM_REQUEST_TIMEOUT) as client:
+                r = client.post(TIKWM_V2_URL, data=body, headers=TIKWM_HEADERS)
+                r.raise_for_status()
+                j = r.json()
+
+            if j.get("code") != 0:
+                logger.debug("V2 API failed for %s: %s", candidate[:60], j.get("msg"))
+                continue
+
+            data = j.get("data") or {}
+            if not data:
+                continue
+
+            # V2 returns direct data (not task-based)
+            # Prefer hdplay (server-accessible) over play (may be browser-session-dependent)
+            hdplay = data.get("hdplay") or ""
+            play = data.get("play") or ""
+            final_url = hdplay or play
+
+            if not final_url:
+                continue
+
+            cover = data.get("cover") or data.get("origin_cover") or data.get("dynamic_cover") or ""
+            author = data.get("author") or {}
+            if isinstance(author, dict):
+                username = author.get("unique_id") or author.get("nickname") or "unknown"
+            else:
+                username = str(author) if author else "unknown"
+
+            stats = data.get("stats") or {}
+            view_count = stats.get("play_count") or stats.get("playCount") or 0
+            duration = data.get("duration") or 0
+            title = data.get("title") or ""
+
+            return {
+                "play_url": final_url,
+                "cover": cover,
+                "username": username,
+                "video_id": str(data.get("id", "")) or extract_video_id_from_url(url) or "unknown",
+                "create_time": data.get("create_time") or data.get("createTime"),
+                "desc": title or safe_caption(data.get("title", "")),
+                "images": data.get("images") or [],
+                "view_count": int(view_count) if view_count else 0,
+                "duration": int(duration) if duration else 0,
+            }
+
+        except Exception as e:
+            logger.warning("V2 API error for %s: %s", candidate[:60], e)
+            continue
+
+    return None
+
+
+# ─── TikWM V1 Task API (Fallback) ─────────────────────────────────
+
+def _submit_tikwm_v1(url: str) -> Optional[dict]:
+    """
+    Submit to TikWM V1 task-based API (submit + poll).
+    Used as fallback when V2 fails to parse the URL.
+    """
+    candidates = url_candidates(url)
     video_id_from_url = extract_video_id_from_url(url)
 
     for candidate in candidates:
         try:
             body = f"web=1&url={quote(candidate)}"
             with httpx.Client(timeout=TIKWM_REQUEST_TIMEOUT) as client:
-                r = client.post(TIKWM_SUBMIT_URL, data=body, headers=TIKWM_HEADERS)
+                r = client.post(TIKWM_V1_SUBMIT_URL, data=body, headers=TIKWM_HEADERS)
                 r.raise_for_status()
                 j = r.json()
 
@@ -132,7 +198,7 @@ def _submit_tikwm_task(url: str) -> Optional[dict]:
                 time.sleep(TIKWM_POLL_INTERVAL)
                 try:
                     with httpx.Client(timeout=TIKWM_REQUEST_TIMEOUT) as client:
-                        poll = client.get(TIKWM_RESULT_BASE + str(task_id), headers=TIKWM_HEADERS)
+                        poll = client.get(TIKWM_V1_RESULT_BASE + str(task_id), headers=TIKWM_HEADERS)
                     if poll.status_code != 200:
                         continue
                     j2 = poll.json()
@@ -145,13 +211,8 @@ def _submit_tikwm_task(url: str) -> Optional[dict]:
                     if status == 2:  # Ready
                         detail = result_data.get("detail") or result_data
 
-                        # ── Extract video URL ──
-                        # Prefer hdplay (tokcdn.com - server accessible) over play_url (webapp-prime - blocks server IPs)
-                        hdplay = (
-                            detail.get("hdplay")
-                            or result_data.get("hdplay")
-                            or ""
-                        )
+                        # Prefer hdplay over play_url
+                        hdplay = detail.get("hdplay") or result_data.get("hdplay") or ""
                         play_url = (
                             detail.get("play_url")
                             or detail.get("url")
@@ -159,11 +220,8 @@ def _submit_tikwm_task(url: str) -> Optional[dict]:
                             or result_data.get("play_url")
                             or result_data.get("url")
                         )
-                        # Use hdplay if available (tokcdn.com CDN is accessible from servers)
-                        # Fall back to play_url if hdplay is not available
                         final_url = hdplay or play_url
 
-                        # ── Extract thumbnail / cover ──
                         cover = (
                             detail.get("cover")
                             or detail.get("origin_cover")
@@ -174,7 +232,6 @@ def _submit_tikwm_task(url: str) -> Optional[dict]:
                             or ""
                         )
 
-                        # ── Extract author info ──
                         author = detail.get("author") or result_data.get("author") or {}
                         if isinstance(author, dict):
                             username = (
@@ -207,8 +264,6 @@ def _submit_tikwm_task(url: str) -> Optional[dict]:
                             or ""
                         )
                         images = detail.get("images") or result_data.get("images") or []
-
-                        # ── Extract stats (views, likes, etc.) ──
                         stats = detail.get("stats") or result_data.get("stats") or {}
                         view_count = (
                             stats.get("play_count")
@@ -238,37 +293,36 @@ def _submit_tikwm_task(url: str) -> Optional[dict]:
                             }
                     elif status == 3:  # Failed
                         break
-                except Exception as e:
-                    logger.debug("TikWM poll error: %s", e)
+
+                except Exception:
                     continue
 
         except Exception as e:
-            logger.debug("TikWM submit error for candidate %s: %s", candidate, e)
+            logger.warning("V1 API error for %s: %s", candidate[:60], e)
             continue
 
     return None
 
 
-def _pick_best_tikwm_url(detail: dict) -> str:
+# ─── Combined TikWM Submission ────────────────────────────────────
+
+def _submit_tikwm_task(url: str) -> Optional[dict]:
     """
-    Select the best video URL from TikWM detail dict.
-    Prioritise video+audio muxed formats over audio-only.
+    Submit to TikWM API. Tries V2 first (fast, direct), then V1 (task-based).
+    Both prioritize hdplay URLs which are server-accessible.
     """
-    # play_url is already the best (muxed) URL from TikWM
-    play_url = (
-        detail.get("play_url")
-        or detail.get("url")
-        or detail.get("play")
-    )
-    if play_url:
-        return play_url
+    # Try V2 first (direct, faster, returns hdplay)
+    logger.debug("Trying TikWM V2 API for %s", url[:60])
+    result = _submit_tikwm_v2(url)
+    if result:
+        return result
 
-    # Fallback: check music field and avoid it
-    music = detail.get("music") or {}
-    music_url = music.get("play_url") or music.get("play") or ""
+    # Fallback to V1 (task-based)
+    logger.debug("V2 failed, trying TikWM V1 API for %s", url[:60])
+    return _submit_tikwm_v1(url)
 
-    return music_url
 
+# ─── Schema Conversion ────────────────────────────────────────────
 
 def _tikwm_single_result_to_schema(result: dict) -> dict:
     """Convert TikWM single video result to the SingleVideoResponse schema."""
@@ -289,9 +343,10 @@ async def extract_single_video(url: str) -> dict[str, Any]:
 
     Strategy:
       1. Resolve short links (vt/vm) to canonical URLs
-      2. Try TikWM API (works server-side, no IP restrictions)
-      3. Fallback to yt-dlp
-      4. Fallback to httpx scraping
+      2. Try TikWM V2 API (direct, returns hdplay)
+      3. Fallback to TikWM V1 API (task-based)
+      4. Fallback to yt-dlp
+      5. Fallback to httpx scraping
 
     Returns a dict matching the SingleVideoResponse schema.
     Raises ValueError if the URL is invalid.
@@ -308,7 +363,7 @@ async def extract_single_video(url: str) -> dict[str, Any]:
     canonical_url = await asyncio.to_thread(resolve_short_link, url)
     logger.info("Resolved URL: %s -> %s", url[:60], canonical_url[:60])
 
-    # Step 2: Try TikWM API (primary method)
+    # Step 2: Try TikWM API (V2 primary, V1 fallback)
     logger.info("Trying TikWM API for %s", canonical_url[:60])
     tikwm_result = await asyncio.to_thread(_submit_tikwm_task, canonical_url)
 
@@ -348,8 +403,8 @@ def _info_has_video_data(info: dict) -> bool:
 
 async def _fallback_single_extract(url: str) -> Optional[dict]:
     """
-    Fallback extraction using httpx.  Attempts to follow redirects and
-    parse the page for canonical video metadata from TikTok's embedded JSON.
+    Fallback extraction using httpx. Attempts to parse the page for
+    canonical video metadata from TikTok's embedded JSON.
     """
     try:
         async with httpx.AsyncClient(
@@ -366,7 +421,7 @@ async def _fallback_single_extract(url: str) -> Optional[dict]:
             resp.raise_for_status()
             html = resp.text
 
-        # Pattern 1: __UNIVERSAL_DATA_FOR_REHYDRATION__
+        # Pattern: __UNIVERSAL_DATA_FOR_REHYDRATION__
         match = re.search(
             r'<script\s+id="__UNIVERSAL_DATA_FOR_REHYDRATION__"[^>]*>\s*(\{.+?)\s*</script>',
             html,
@@ -381,25 +436,22 @@ async def _fallback_single_extract(url: str) -> Optional[dict]:
             except json.JSONDecodeError:
                 pass
 
-        # Pattern 2: SIGI_STATE
-        match2 = re.search(
-            r'<script\s+id="SIGI_STATE"[^>]*>\s*(\{.+?)\s*</script>',
-            html,
-            re.DOTALL,
-        )
-        if match2:
+        # Pattern: SIGI_STATE
+        match = re.search(r'<script id="__UNIVERSAL_DATA_FOR_REHYDRATION__"[^>]*>(.*?)</script>', html, re.DOTALL)
+        if not match:
+            match = re.search(r'"SIGI_STATE":\s*(\{.+?\})\s*[,}]', html, re.DOTALL)
+        if match:
             try:
-                data = json.loads(match2.group(1))
+                raw = match.group(1)
+                data = json.loads(raw)
                 result = _parse_sigi_state(data)
                 if result:
                     return result
             except json.JSONDecodeError:
                 pass
 
-    except httpx.HTTPStatusError as e:
-        logger.warning("HTTP error during fallback for %s: %s", url, e.response.status_code)
-    except Exception as exc:
-        logger.warning("Fallback extraction failed for %s: %s", url, exc)
+    except Exception as e:
+        logger.warning("httpx fallback failed for %s: %s", url[:60], e)
 
     return None
 
@@ -407,71 +459,138 @@ async def _fallback_single_extract(url: str) -> Optional[dict]:
 def _parse_universal_data(data: dict) -> Optional[dict]:
     """Parse TikTok's __UNIVERSAL_DATA_FOR_REHYDRATION__ embedded JSON."""
     try:
-        default_scope = data.get("__DEFAULT_SCOPE__", {})
-        webapp_data = default_scope.get("webapp.video-detail", {})
-        item_info = webapp_data.get("itemInfo", {}).get("itemStruct", {})
-        if not item_info:
+        scope = data.get("__DEFAULT_SCOPE__", {})
+        detail = scope.get("webapp.video-detail", {})
+        item_info = detail.get("itemInfo", {}) or detail
+        item_struct = item_info.get("itemStruct", {})
+
+        if not item_struct:
+            # Try alternative path
+            item_struct = detail.get("itemStruct") or {}
+
+        if not item_struct:
             return None
 
-        video_data = item_info.get("video", {})
-        author_data = item_info.get("author", {})
-        stats = item_info.get("stats", {})
+        video = item_struct.get("video", {})
+        play_addr = video.get("playAddr", "")
 
-        download_url = ""
-        for bit in video_data.get("bitrateInfo", []):
-            candidate = bit.get("PlayAddr", {}).get("UrlList", [])
-            if candidate:
-                download_url = candidate[0]
-                break
-        if not download_url:
-            download_url = video_data.get("downloadAddr", "")
+        # Extract author
+        author_data = item_struct.get("author", {})
+        author_name = author_data.get("uniqueId") or author_data.get("nickname") or "unknown"
+
+        # Extract stats
+        stats = item_struct.get("stats", {})
+        view_count = stats.get("playCount") or 0
+
+        # Extract description/title
+        desc = item_struct.get("desc") or ""
+
+        # Extract cover
+        cover = video.get("cover") or video.get("originCover") or video.get("dynamicCover") or ""
+
+        # Extract duration
+        duration = video.get("duration") or 0
+
+        # Extract music (audio URL)
+        music = item_struct.get("music", {})
+        music_url = music.get("playUrl") or ""
 
         return {
-            "title": item_info.get("desc", ""),
-            "author": f"@{author_data.get('uniqueId', author_data.get('nickname', 'unknown'))}",
-            "view_count": stats.get("playCount", 0),
-            "thumbnail": video_data.get("cover", ""),
-            "download_url": download_url,
-            "duration": video_data.get("duration", 0),
+            "title": desc or "TikTok Video",
+            "author": f"@{author_name}",
+            "description": desc,
+            "views": format_views(view_count),
+            "view_count": view_count,
+            "thumbnail": cover,
+            "duration": duration,
+            "url": play_addr or music_url,
+            "formats": [],
         }
-    except (KeyError, TypeError):
+
+    except Exception as e:
+        logger.debug("Failed to parse universal data: %s", e)
         return None
 
 
 def _parse_sigi_state(data: dict) -> Optional[dict]:
-    """Parse TikTok's older SIGI_STATE embedded JSON format."""
+    """Parse TikTok's SIGI_STATE embedded JSON."""
     try:
         item_module = data.get("ItemModule", {})
         if not item_module:
             return None
-        item_key = next(iter(item_module.keys()))
-        item = item_module[item_key]
 
-        video_data = item.get("video", {})
-        author_data = item.get("author", "")
+        # Get first video item
+        first_key = next(iter(item_module), None)
+        if not first_key:
+            return None
+
+        item = item_module[first_key]
+        video = item.get("video", {})
+
+        play_addr = video.get("playAddr", "")
+        author_name = item.get("author", "")
+        desc = item.get("desc", "")
         stats = item.get("stats", {})
+        view_count = stats.get("playCount") or 0
+        cover = video.get("cover") or ""
+        duration = video.get("duration") or 0
 
         return {
-            "title": item.get("desc", ""),
-            "author": f"@{author_data}",
-            "view_count": stats.get("playCount", 0),
-            "thumbnail": video_data.get("cover", ""),
-            "download_url": video_data.get("downloadAddr", ""),
-            "duration": video_data.get("duration", 0),
+            "title": desc or "TikTok Video",
+            "author": f"@{author_name}" if author_name else "@unknown",
+            "description": desc,
+            "views": format_views(view_count),
+            "view_count": view_count,
+            "thumbnail": cover,
+            "duration": duration,
+            "url": play_addr,
+            "formats": [],
         }
-    except (KeyError, TypeError, StopIteration):
+
+    except Exception as e:
+        logger.debug("Failed to parse SIGI_STATE: %s", e)
         return None
 
 
-def _normalise_single_info(info: dict, original_url: str = "") -> dict:
-    """Normalise raw yt-dlp or fallback output into the shape expected by the frontend."""
+# ─── yt-dlp Helpers ───────────────────────────────────────────────
+
+def _base_ydl_opts() -> dict:
+    """Base yt-dlp options for metadata-only extraction."""
+    return {
+        "quiet": True,
+        "no_warnings": True,
+        "extract_flat": False,
+        "skip_download": True,
+        "no_download": True,
+        "format": "best/bestvideo+bestaudio/best",
+        "noplaylist": True,
+        "ignoreerrors": True,
+        "http_headers": {
+            "User-Agent": settings.DEFAULT_USER_AGENT,
+            "Referer": settings.DEFAULT_REFERER,
+        },
+    }
+
+
+def _run_yt_dlp_blocking(url: str, ydl_opts: dict) -> Optional[dict]:
+    """Run yt-dlp in blocking mode (called via asyncio.to_thread)."""
+    try:
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(url, download=False)
+            if info:
+                return info
+    except Exception as e:
+        logger.warning("yt-dlp failed for %s: %s", url[:60], e)
+    return None
+
+
+def _normalise_single_info(info: dict, canonical_url: str) -> dict:
+    """Convert yt-dlp info dict to the SingleVideoResponse schema."""
     download_url = _pick_download_url(info)
-    if not download_url:
-        download_url = info.get("webpage_url", info.get("url", ""))
 
     return {
-        "title": safe_caption(info.get("title", info.get("description", ""))),
-        "author": info.get("uploader", info.get("channel", info.get("author", "@unknown"))),
+        "title": safe_caption(info.get("title", "") or info.get("description", "") or "TikTok Video"),
+        "author": f"@{info.get('uploader', info.get('channel', 'unknown'))}",
         "views": format_views(info.get("view_count", 0)),
         "thumbnail": info.get("thumbnail", ""),
         "download_url": download_url,
@@ -486,11 +605,9 @@ def _pick_download_url(info: dict) -> str:
     formats = info.get("formats", []) or []
 
     def _is_muxed(fmt: dict) -> bool:
-        """Check if format has both video and audio (muxed)."""
         vcodec = (fmt.get("vcodec") or "").lower()
         acodec = (fmt.get("acodec") or "").lower()
         height = fmt.get("height") or 0
-        # Audio-only: has acodec but no video (no vcodec or vcodec is 'none')
         is_audio_only = (
             acodec
             and acodec not in ("none", "")
@@ -499,10 +616,8 @@ def _pick_download_url(info: dict) -> str:
         )
         return not is_audio_only
 
-    # Filter to muxed (video+audio) formats only
     muxed_formats = [f for f in formats if _is_muxed(f)]
     if not muxed_formats:
-        # If no muxed formats, fall back to all formats
         muxed_formats = formats
 
     sorted_formats = sorted(
@@ -531,222 +646,56 @@ def _pick_download_url(info: dict) -> str:
 async def extract_bulk_profile(username_raw: str, delay: float = 1.0) -> dict:
     """
     Extract metadata for all public videos on a TikTok profile.
-
     Uses TikWM API for each video URL discovered from the profile page.
-
-    Returns a dict matching BulkExtractResponse.
     """
     username = normalise_username(username_raw)
     profile_url = f"https://www.tiktok.com/@{username}"
 
-    # Step 1: Try yt-dlp first (fastest for bulk)
-    ydl_opts = _base_ydl_opts()
-    info = await asyncio.to_thread(_run_yt_dlp_blocking, profile_url, ydl_opts)
-
-    if info and info.get("entries"):
-        return _normalise_bulk_info(info, username)
-
-    # Step 2: Try httpx scraping to get video list from profile page
-    logger.info("yt-dlp could not resolve profile %s, trying httpx fallback", username)
-    video_urls = await _get_profile_video_urls(username)
-
-    if not video_urls:
-        raise RuntimeError(
-            f"Could not extract profile data for @{username}. "
-            "Ensure the account is public and has videos available."
-        )
-
-    # Step 3: Use TikWM API for each video to get no-watermark URLs
-    logger.info("Found %d videos for @%s, extracting via TikWM", len(video_urls), username)
-    videos = []
-    for i, vid_data in enumerate(video_urls[:settings.MAX_BULK_VIDEOS]):
-        if i > 0:
-            await asyncio.sleep(min(delay, 2.0))
-
-        video_url = vid_data.get("url")
-        if not video_url:
-            continue
-
-        # Try TikWM for this video
-        tikwm_result = await asyncio.to_thread(_submit_tikwm_task, video_url)
-        if tikwm_result and tikwm_result.get("play_url"):
-            videos.append({
-                "caption": safe_caption(vid_data.get("desc", tikwm_result.get("desc", ""))),
-                "views": format_views(vid_data.get("view_count", tikwm_result.get("view_count", 0))),
-                "duration": format_duration(vid_data.get("duration", tikwm_result.get("duration", 0))),
-                "url": tikwm_result.get("play_url", video_url),
-            })
-        else:
-            # Fallback: just use the TikTok page URL
-            videos.append({
-                "caption": safe_caption(vid_data.get("desc", "")),
-                "views": format_views(vid_data.get("view_count", 0)),
-                "duration": format_duration(vid_data.get("duration", 0)),
-                "url": video_url,
-            })
-
-    if not videos:
-        raise RuntimeError(
-            f"Could not extract profile data for @{username}. "
-            "Ensure the account is public and has videos available."
-        )
-
-    return {
-        "username": f"@{username}",
-        "total_videos": len(videos),
-        "videos": videos,
-    }
-
-
-async def _get_profile_video_urls(username: str) -> list[dict]:
-    """
-    Scrape a TikTok profile page to extract video URLs and metadata.
-    Returns a list of dicts with url, desc, view_count, duration.
-    """
+    # Resolve profile page to get video URLs
     try:
         async with httpx.AsyncClient(
             follow_redirects=True,
-            timeout=30.0,
+            timeout=20.0,
             headers={
                 "User-Agent": settings.DEFAULT_USER_AGENT,
                 "Referer": settings.DEFAULT_REFERER,
                 "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
             },
         ) as client:
-            resp = await client.get(f"https://www.tiktok.com/@{username}")
+            resp = await client.get(profile_url)
             resp.raise_for_status()
             html = resp.text
+    except Exception as e:
+        raise RuntimeError(f"Could not access profile {username}: {e}")
 
-        # Try __UNIVERSAL_DATA_FOR_REHYDRATION__
-        match = re.search(
-            r'<script\s+id="__UNIVERSAL_DATA_FOR_REHYDRATION__"[^>]*>\s*(\{.+?)\s*</script>',
-            html,
-            re.DOTALL,
+    # Extract video URLs from the page
+    video_urls = re.findall(r'https?://(?:www\.)?tiktok\.com/@[^/]+/video/(\d+)', html)
+    video_urls = list(set(video_urls))
+
+    if not video_urls:
+        raise RuntimeError(
+            f"No public videos found for @{username}. The profile may be private or empty."
         )
-        if match:
-            try:
-                data = json.loads(match.group(1))
-                default_scope = data.get("__DEFAULT_SCOPE__", {})
-                user_profile = default_scope.get("webapp.user-detail", {})
-                user_info = user_profile.get("userInfo", {}).get("user", {})
-                item_list = user_info.get("itemList", [])
 
-                if item_list:
-                    videos = []
-                    for item in item_list[:settings.MAX_BULK_VIDEOS]:
-                        video_data = item.get("video", {})
-                        stats = item.get("stats", {})
-                        video_id = item.get("id", "")
-                        videos.append({
-                            "url": f"https://www.tiktok.com/@{username}/video/{video_id}",
-                            "desc": item.get("desc", ""),
-                            "view_count": stats.get("playCount", 0),
-                            "duration": video_data.get("duration", 0),
-                        })
-                    return videos
-            except json.JSONDecodeError:
-                pass
-
-        # Try SIGI_STATE
-        match2 = re.search(
-            r'<script\s+id="SIGI_STATE"[^>]*>\s*(\{.+?)\s*</script>',
-            html,
-            re.DOTALL,
-        )
-        if match2:
-            try:
-                data = json.loads(match2.group(1))
-                user_module = data.get("UserModule", {})
-                user_info = user_module.get("users", {}).get(username, {})
-                items = user_info.get("itemList", [])
-                if items:
-                    videos = []
-                    for item in items[:settings.MAX_BULK_VIDEOS]:
-                        video_data = item.get("video", {})
-                        stats = item.get("stats", {})
-                        videos.append({
-                            "url": f"https://www.tiktok.com/@{username}/video/{item.get('id', '')}",
-                            "desc": item.get("desc", ""),
-                            "view_count": stats.get("playCount", 0),
-                            "duration": video_data.get("duration", 0),
-                        })
-                    return videos
-            except json.JSONDecodeError:
-                pass
-
-    except Exception as exc:
-        logger.warning("Profile scraping failed for @%s: %s", username, exc)
-
-    return []
-
-
-def _normalise_bulk_info(info: dict, username: str) -> dict:
-    """Normalise yt-dlp bulk output into the expected response shape."""
-    entries = info.get("entries", []) or []
-    entries = entries[:settings.MAX_BULK_VIDEOS]
-
+    # Extract each video using TikWM
     videos = []
-    for entry in entries:
-        videos.append(_normalise_bulk_entry(entry))
+    for video_id in video_urls:
+        video_url = f"https://www.tiktok.com/@{username}/video/{video_id}"
+        try:
+            await asyncio.sleep(delay)
+            result = await asyncio.to_thread(_submit_tikwm_task, video_url)
+            if result and result.get("play_url"):
+                videos.append({
+                    "caption": safe_caption(result.get("desc", "")),
+                    "views": format_views(result.get("view_count", 0)),
+                    "duration": format_duration(result.get("duration", 0)),
+                    "url": result.get("play_url", ""),
+                })
+        except Exception as e:
+            logger.warning("Failed to extract video %s: %s", video_id, e)
 
     return {
-        "username": f"@{username}",
+        "username": username,
         "total_videos": len(videos),
         "videos": videos,
     }
-
-
-def _normalise_bulk_entry(entry: dict) -> dict:
-    """Normalise a single entry from yt-dlp bulk output."""
-    view_count = entry.get("view_count", 0)
-    if not view_count:
-        stats = entry.get("stats", {})
-        view_count = stats.get("viewCount", stats.get("playCount", 0))
-
-    return {
-        "caption": safe_caption(entry.get("title", entry.get("description", ""))),
-        "views": format_views(view_count),
-        "duration": format_duration(entry.get("duration", 0)),
-        "url": entry.get("webpage_url", entry.get("url", "")),
-    }
-
-
-# ─── Shared yt-dlp options ────────────────────────────────────────
-
-def _base_ydl_opts() -> dict:
-    """Return the base yt-dlp options dictionary."""
-    return {
-        "quiet": True,
-        "no_warnings": True,
-        "extract_flat": False,
-        "skip_download": True,
-        "socket_timeout": settings.YT_DLP_SO_TIMEOUT,
-        "retries": settings.YT_DLP_MAX_RETRIES,
-        "http_headers": {
-            "User-Agent": settings.DEFAULT_USER_AGENT,
-            "Referer": settings.DEFAULT_REFERER,
-            "Accept-Language": "en-US,en;q=0.9",
-            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-        },
-    }
-
-
-def _run_yt_dlp_blocking(url: str, ydl_opts: dict) -> Optional[dict]:
-    """
-    Run yt-dlp in a blocking fashion. Called from asyncio.to_thread.
-    Returns the extracted info dict or None on failure.
-    """
-    try:
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            try:
-                info = ydl.extract_info(url, download=False)
-                return info
-            except yt_dlp.utils.DownloadError as e:
-                logger.warning("yt-dlp DownloadError for %s: %s", url, e)
-                return None
-            except Exception as e:
-                logger.warning("yt-dlp unexpected error for %s: %s", url, e)
-                return None
-    except Exception as e:
-        logger.warning("yt-dlp init error for %s: %s", url, e)
-        return None
