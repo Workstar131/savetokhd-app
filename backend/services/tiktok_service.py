@@ -3,7 +3,7 @@ TikTok extraction service.
 
 Primary engine: TikWM V2 API (https://tikwm.com/api/) — returns hdplay URLs
 from server-accessible CDN domains (tiktokcdn-us.com, tokcdn.com).
-Fallback: TikWM V1 task-based API for videos that V2 can't parse.
+Rejects webapp-prime.us.tiktok.com URLs which always 403 on server requests.
 
 All blocking calls are executed inside asyncio.to_thread so the
 FastAPI event loop stays non-blocking.
@@ -33,9 +33,7 @@ logger = logging.getLogger(__name__)
 
 # ─── TikWM API Configuration ──────────────────────────────────────
 
-# V2 API: Direct POST, returns result immediately (preferred)
 TIKWM_V2_URL = "https://tikwm.com/api/"
-# V1 API: Task-based submit + poll (fallback)
 TIKWM_V1_SUBMIT_URL = "https://tikwm.com/api/video/task/submit"
 TIKWM_V1_RESULT_BASE = "https://tikwm.com/api/video/task/result?task_id="
 
@@ -44,12 +42,122 @@ TIKWM_HEADERS = {
     "Accept": "application/json, text/javascript, */*; q=0.01",
     "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
     "Origin": "https://tikwm.com",
-    "Referer": "https://tikwm.com/",
+    "Referer": "https://tiktok.com/",
     "x-requested-with": "XMLHttpRequest",
 }
-TIKWM_POLL_INTERVAL = 1.0  # seconds
-TIKWM_POLL_ATTEMPTS = 40   # max polls before giving up
-TIKWM_REQUEST_TIMEOUT = 25  # seconds
+TIKWM_POLL_INTERVAL = 1.0
+TIKWM_POLL_ATTEMPTS = 40
+TIKWM_REQUEST_TIMEOUT = 25
+
+# CDN domains that are server-accessible (don't block non-browser IPs)
+SERVER_ACCESSIBLE_CDN_DOMAINS = (
+    "tiktokcdn-us.com",
+    "tiktokcdn.com",
+    "tokcdn.com",
+    "byteoversea.com",
+    "bytegecko-i18n.com",
+)
+
+# CDN domains that block server requests (browser-session-dependent)
+BLOCKED_CDN_DOMAINS = (
+    "webapp-prime",
+    "webapp-us",
+    "webapp-va",
+)
+
+# Alternative CDN mirror domains to try when primary fails
+# TikTok CDN URLs are often accessible across multiple mirrors
+CDN_MIRROR_DOMAINS = (
+    "v16.tokcdn.com",
+    "www.tiktok.com",
+    "v16m.tiktokcdn.com",
+    "v16.tiktokcdn.com",
+    "v19.tiktokcdn.com",
+)
+
+
+def swap_cdn_domain(url: str, new_domain: str) -> str:
+    """
+    Replace the CDN hostname in a TikTok CDN URL with an alternative domain.
+    
+    Example:
+        https://v16-notes.tiktokcdn-us.com/path/video.mp4
+        -> https://v16.tokcdn.com/path/video.mp4
+    """
+    from urllib.parse import urlparse, urlunparse
+    parsed = urlparse(url)
+    new_parsed = parsed._replace(netloc=new_domain)
+    return urlunparse(new_parsed)
+
+
+def generate_mirror_urls(url: str) -> list[str]:
+    """
+    Generate alternative CDN URLs by swapping the hostname with known mirrors.
+    Returns a list of URLs to try, starting with the original.
+    """
+    urls = [url]
+    for mirror in CDN_MIRROR_DOMAINS:
+        urls.append(swap_cdn_domain(url, mirror))
+    return urls
+
+
+def test_url_accessible(url: str, timeout: int = 8) -> bool:
+    """
+    Quick test if a CDN URL is accessible (returns non-403 status).
+    Uses a small Range request to minimize data transfer.
+    Only considers it accessible if the content-type is video (not HTML).
+    """
+    headers = {
+        "User-Agent": settings.DEFAULT_USER_AGENT,
+        "Referer": settings.DEFAULT_REFERER,
+        "Range": "bytes=0-0",
+    }
+    try:
+        with httpx.Client(timeout=timeout, follow_redirects=True) as client:
+            r = client.get(url, headers=headers)
+            if r.status_code in (403, 404):
+                return False
+            # Reject non-video responses (HTML error pages)
+            ct = r.headers.get("content-type", "")
+            return not ("text/html" in ct.lower())
+    except Exception:
+        return False
+
+
+async def find_accessible_mirror(url: str, timeout: int = 8) -> Optional[str]:
+    """
+    Test the original URL and all mirror domains in parallel.
+    Returns the first accessible URL found, or None if all fail.
+    
+    Since all requests run simultaneously, total time = time of the fastest
+    working URL (not sum of all attempts). This avoids slowdown.
+    """
+    urls_to_test = generate_mirror_urls(url)
+    
+    async def _test(u: str) -> Optional[str]:
+        if test_url_accessible(u, timeout):
+            return u
+        return None
+    
+    # Run all tests in parallel
+    results = await asyncio.gather(*[_test(u) for u in urls_to_test], return_exceptions=True)
+    
+    # Return first working URL
+    for r in results:
+        if isinstance(r, str):
+            return r
+    return None
+
+
+def _is_server_accessible_url(url: str) -> bool:
+    """Check if a CDN URL is from a server-accessible domain."""
+    lower_url = url.lower()
+    if any(d in lower_url for d in BLOCKED_CDN_DOMAINS):
+        return False
+    if any(d in lower_url for d in SERVER_ACCESSIBLE_CDN_DOMAINS):
+        return True
+    # Default: allow if it has tiktok/tokcdn in domain
+    return "tiktok" in lower_url or "tokcdn" in lower_url
 
 
 # ─── URL Helpers ──────────────────────────────────────────────────
@@ -87,29 +195,38 @@ def extract_video_id_from_url(url: str) -> Optional[str]:
     return m.group(1) if m else None
 
 
+def extract_username_from_url(url: str) -> Optional[str]:
+    """Extract the username from a TikTok URL."""
+    m = re.search(r"tiktok\.com/@([^/]+)/", url)
+    return m.group(1) if m else None
+
+
 def url_candidates(tiktok_url: str) -> list:
     """Generate multiple URL candidates for TikWM API submission."""
     normalized = normalize_tiktok_url(tiktok_url)
     video_id = extract_video_id_from_url(normalized)
+    username = extract_username_from_url(normalized)
+
     candidates = [normalized]
+
     if video_id:
-        for u in (
-            video_id,
-            f"https://www.tiktok.com/video/{video_id}",
-            f"https://www.tiktok.com/@tiktok/video/{video_id}",
-            f"https://m.tiktok.com/v/{video_id}.html",
-        ):
-            if u not in candidates:
-                candidates.append(u)
+        # Add candidates with known usernames to improve TikWM parsing
+        if username:
+            candidates.append(f"https://www.tiktok.com/@{username}/video/{video_id}")
+        candidates.append(f"https://www.tiktok.com/video/{video_id}")
+        candidates.append(f"https://www.tiktok.com/@tiktok/video/{video_id}")
+        candidates.append(f"https://m.tiktok.com/v/{video_id}.html")
+        candidates.append(video_id)
+
     return candidates
 
 
 # ─── TikWM V2 API (Primary) ───────────────────────────────────────
 
-def _submit_tikwm_v2(url: str) -> Optional[dict]:
+async def _submit_tikwm_v2(url: str) -> Optional[dict]:
     """
-    Submit to TikWM V2 API (direct POST, returns result immediately).
-    V2 reliably returns hdplay URLs from server-accessible CDN domains.
+    Submit to TikWM V2 API. Returns result only if the CDN URL is
+    from a server-accessible domain. Tries multiple URL candidates.
     """
     candidates = url_candidates(url)
 
@@ -129,16 +246,43 @@ def _submit_tikwm_v2(url: str) -> Optional[dict]:
             if not data:
                 continue
 
-            # V2 returns direct data (not task-based)
-            # Prefer hdplay (server-accessible) over play (may be browser-session-dependent)
+            # V2 returns: hdplay, play, cover, origin_cover, dynamic_cover, title, author, stats, etc.
             hdplay = data.get("hdplay") or ""
             play = data.get("play") or ""
-            final_url = hdplay or play
+
+            # Prefer hdplay (almost always server-accessible)
+            # Only use play if hdplay is empty AND play is from an accessible domain
+            final_url = ""
+            if hdplay and _is_server_accessible_url(hdplay):
+                final_url = hdplay
+            elif play and _is_server_accessible_url(play):
+                final_url = play
+            elif hdplay:
+                # hdplay exists but not accessible — try next candidate
+                logger.debug("hdplay not server-accessible for %s, trying next candidate", candidate[:40])
+                continue
 
             if not final_url:
                 continue
 
+            # Extract metadata
             cover = data.get("cover") or data.get("origin_cover") or data.get("dynamic_cover") or ""
+            
+            # Test if the URL is actually accessible, try mirrors in parallel if not
+            if final_url and not test_url_accessible(final_url):
+                logger.info("Primary CDN URL not accessible, trying mirrors for %s", final_url[:60])
+                accessible = await find_accessible_mirror(final_url)
+                if accessible:
+                    logger.info("Found accessible mirror: %s", accessible[:80])
+                    final_url = accessible
+                else:
+                    # No mirror worked, continue to next candidate
+                    logger.debug("No accessible mirror found, trying next candidate")
+                    continue
+
+            if not final_url:
+                continue
+
             author = data.get("author") or {}
             if isinstance(author, dict):
                 username = author.get("unique_id") or author.get("nickname") or "unknown"
@@ -171,10 +315,10 @@ def _submit_tikwm_v2(url: str) -> Optional[dict]:
 
 # ─── TikWM V1 Task API (Fallback) ─────────────────────────────────
 
-def _submit_tikwm_v1(url: str) -> Optional[dict]:
+async def _submit_tikwm_v1(url: str) -> Optional[dict]:
     """
-    Submit to TikWM V1 task-based API (submit + poll).
-    Used as fallback when V2 fails to parse the URL.
+    Submit to TikWM V1 task-based API.
+    Only used if V2 fails entirely. Same domain filtering applies.
     """
     candidates = url_candidates(url)
     video_id_from_url = extract_video_id_from_url(url)
@@ -193,7 +337,6 @@ def _submit_tikwm_v1(url: str) -> Optional[dict]:
             if code != 0 or not task_id:
                 continue
 
-            # Poll for result
             for _ in range(TIKWM_POLL_ATTEMPTS):
                 time.sleep(TIKWM_POLL_INTERVAL)
                 try:
@@ -206,93 +349,80 @@ def _submit_tikwm_v1(url: str) -> Optional[dict]:
                         continue
 
                     result_data = j2["data"]
-                    status = result_data.get("status")
-
-                    if status == 2:  # Ready
-                        detail = result_data.get("detail") or result_data
-
-                        # Prefer hdplay over play_url
-                        hdplay = detail.get("hdplay") or result_data.get("hdplay") or ""
-                        play_url = (
-                            detail.get("play_url")
-                            or detail.get("url")
-                            or detail.get("play")
-                            or result_data.get("play_url")
-                            or result_data.get("url")
-                        )
-                        final_url = hdplay or play_url
-
-                        cover = (
-                            detail.get("cover")
-                            or detail.get("origin_cover")
-                            or detail.get("dynamic_cover")
-                            or result_data.get("cover")
-                            or result_data.get("origin_cover")
-                            or result_data.get("dynamic_cover")
-                            or ""
-                        )
-
-                        author = detail.get("author") or result_data.get("author") or {}
-                        if isinstance(author, dict):
-                            username = (
-                                author.get("unique_id")
-                                or author.get("nickname")
-                                or "unknown"
-                            )
-                        else:
-                            username = author or "unknown"
-
-                        vid = (
-                            detail.get("video_id")
-                            or result_data.get("video_id")
-                            or video_id_from_url
-                            or "unknown"
-                        )
-                        if isinstance(vid, (int, float)):
-                            vid = str(int(vid))
-                        create_time = (
-                            detail.get("create_time")
-                            or detail.get("createTime")
-                            or result_data.get("create_time")
-                        )
-                        desc = (
-                            detail.get("title")
-                            or detail.get("desc")
-                            or detail.get("caption")
-                            or result_data.get("title")
-                            or result_data.get("desc")
-                            or ""
-                        )
-                        images = detail.get("images") or result_data.get("images") or []
-                        stats = detail.get("stats") or result_data.get("stats") or {}
-                        view_count = (
-                            stats.get("play_count")
-                            or stats.get("playCount")
-                            or stats.get("view_count")
-                            or detail.get("view_count")
-                            or result_data.get("view_count")
-                            or 0
-                        )
-                        duration = (
-                            detail.get("duration")
-                            or result_data.get("duration")
-                            or 0
-                        )
-
-                        if final_url:
-                            return {
-                                "play_url": final_url,
-                                "cover": cover,
-                                "username": username,
-                                "video_id": vid,
-                                "create_time": create_time,
-                                "desc": desc,
-                                "images": images if isinstance(images, list) else [],
-                                "view_count": int(view_count) if view_count else 0,
-                                "duration": int(duration) if duration else 0,
-                            }
-                    elif status == 3:  # Failed
+                    if result_data.get("status") == 3:  # Failed
                         break
+
+                    if result_data.get("status") != 2:  # Not ready yet
+                        continue
+
+                    detail = result_data.get("detail") or result_data
+
+                    hdplay = detail.get("hdplay") or result_data.get("hdplay") or ""
+                    play_url = (
+                        detail.get("play_url")
+                        or detail.get("url")
+                        or detail.get("play")
+                        or result_data.get("play_url")
+                        or result_data.get("url")
+                        or ""
+                    )
+
+                    final_url = ""
+                    if hdplay and _is_server_accessible_url(hdplay):
+                        final_url = hdplay
+                    elif play_url and _is_server_accessible_url(play_url):
+                        final_url = play_url
+                    elif hdplay:
+                        # hdplay exists but not accessible — try next candidate
+                        logger.debug("V1 hdplay not accessible, trying next candidate")
+                        break
+
+                    if not final_url:
+                        continue
+
+                    # Test if the URL is accessible, try mirrors in parallel if not
+                    if final_url and not test_url_accessible(final_url):
+                        accessible = await find_accessible_mirror(final_url)
+                        if accessible:
+                            final_url = accessible
+
+                    if not final_url:
+                        continue
+
+                    cover = (
+                        detail.get("cover")
+                        or detail.get("origin_cover")
+                        or detail.get("dynamic_cover")
+                        or result_data.get("cover")
+                        or ""
+                    )
+                    author = detail.get("author") or result_data.get("author") or {}
+                    if isinstance(author, dict):
+                        username = author.get("unique_id") or author.get("nickname") or "unknown"
+                    else:
+                        username = str(author) if author else "unknown"
+
+                    stats = detail.get("stats") or result_data.get("stats") or {}
+                    view_count = (
+                        stats.get("play_count")
+                        or stats.get("playCount")
+                        or detail.get("view_count")
+                        or result_data.get("view_count")
+                        or 0
+                    )
+                    duration = detail.get("duration") or result_data.get("duration") or 0
+
+                    return {
+                        "play_url": final_url,
+                        "cover": cover,
+                        "username": username,
+                        "video_id": str(video_id_from_url) if video_id_from_url else "unknown",
+                        "create_time": detail.get("create_time") or result_data.get("create_time"),
+                        "desc": detail.get("title") or detail.get("desc") or result_data.get("title") or "",
+                        "images": detail.get("images") or result_data.get("images") or [],
+                        "view_count": int(view_count) if view_count else 0,
+                        "duration": int(duration) if duration else 0,
+                    }
 
                 except Exception:
                     continue
@@ -306,20 +436,19 @@ def _submit_tikwm_v1(url: str) -> Optional[dict]:
 
 # ─── Combined TikWM Submission ────────────────────────────────────
 
-def _submit_tikwm_task(url: str) -> Optional[dict]:
+async def _submit_tikwm_task(url: str) -> Optional[dict]:
     """
-    Submit to TikWM API. Tries V2 first (fast, direct), then V1 (task-based).
-    Both prioritize hdplay URLs which are server-accessible.
+    Submit to TikWM. Tries V2 first (direct, server-accessible URLs).
+    Falls back to V1 only if V2 completely fails.
     """
-    # Try V2 first (direct, faster, returns hdplay)
     logger.debug("Trying TikWM V2 API for %s", url[:60])
-    result = _submit_tikwm_v2(url)
+    result = await _submit_tikwm_v2(url)
     if result:
         return result
 
-    # Fallback to V1 (task-based)
-    logger.debug("V2 failed, trying TikWM V1 API for %s", url[:60])
-    return _submit_tikwm_v1(url)
+    # Only fall back to V1 if V2 failed entirely (not just bad domain)
+    logger.debug("V2 failed entirely, trying TikWM V1 API for %s", url[:60])
+    return await _submit_tikwm_v1(url)
 
 
 # ─── Schema Conversion ────────────────────────────────────────────
@@ -343,14 +472,12 @@ async def extract_single_video(url: str) -> dict[str, Any]:
 
     Strategy:
       1. Resolve short links (vt/vm) to canonical URLs
-      2. Try TikWM V2 API (direct, returns hdplay)
+      2. Try TikWM V2 API (direct, server-accessible CDN URLs)
       3. Fallback to TikWM V1 API (task-based)
       4. Fallback to yt-dlp
       5. Fallback to httpx scraping
 
     Returns a dict matching the SingleVideoResponse schema.
-    Raises ValueError if the URL is invalid.
-    Raises RuntimeError if extraction fails.
     """
     url = url.strip()
     if not is_valid_tiktok_url(url):
@@ -364,11 +491,10 @@ async def extract_single_video(url: str) -> dict[str, Any]:
     logger.info("Resolved URL: %s -> %s", url[:60], canonical_url[:60])
 
     # Step 2: Try TikWM API (V2 primary, V1 fallback)
-    logger.info("Trying TikWM API for %s", canonical_url[:60])
-    tikwm_result = await asyncio.to_thread(_submit_tikwm_task, canonical_url)
+    tikwm_result = await _submit_tikwm_task(canonical_url)
 
     if tikwm_result and tikwm_result.get("play_url"):
-        logger.info("TikWM returned video: %s", tikwm_result.get("desc", "")[:60])
+        logger.info("TikWM returned video from: %s", tikwm_result.get("play_url", "")[:60])
         return _tikwm_single_result_to_schema(tikwm_result)
 
     # Step 3: Try yt-dlp
@@ -402,10 +528,7 @@ def _info_has_video_data(info: dict) -> bool:
 
 
 async def _fallback_single_extract(url: str) -> Optional[dict]:
-    """
-    Fallback extraction using httpx. Attempts to parse the page for
-    canonical video metadata from TikTok's embedded JSON.
-    """
+    """Fallback extraction using httpx — parse TikTok's embedded JSON."""
     try:
         async with httpx.AsyncClient(
             follow_redirects=True,
@@ -437,9 +560,7 @@ async def _fallback_single_extract(url: str) -> Optional[dict]:
                 pass
 
         # Pattern: SIGI_STATE
-        match = re.search(r'<script id="__UNIVERSAL_DATA_FOR_REHYDRATION__"[^>]*>(.*?)</script>', html, re.DOTALL)
-        if not match:
-            match = re.search(r'"SIGI_STATE":\s*(\{.+?\})\s*[,}]', html, re.DOTALL)
+        match = re.search(r'"SIGI_STATE":\s*(\{.+?\})\s*[,}]', html, re.DOTALL)
         if match:
             try:
                 raw = match.group(1)
@@ -465,35 +586,17 @@ def _parse_universal_data(data: dict) -> Optional[dict]:
         item_struct = item_info.get("itemStruct", {})
 
         if not item_struct:
-            # Try alternative path
-            item_struct = detail.get("itemStruct") or {}
-
-        if not item_struct:
             return None
 
         video = item_struct.get("video", {})
         play_addr = video.get("playAddr", "")
-
-        # Extract author
         author_data = item_struct.get("author", {})
         author_name = author_data.get("uniqueId") or author_data.get("nickname") or "unknown"
-
-        # Extract stats
         stats = item_struct.get("stats", {})
         view_count = stats.get("playCount") or 0
-
-        # Extract description/title
         desc = item_struct.get("desc") or ""
-
-        # Extract cover
         cover = video.get("cover") or video.get("originCover") or video.get("dynamicCover") or ""
-
-        # Extract duration
         duration = video.get("duration") or 0
-
-        # Extract music (audio URL)
-        music = item_struct.get("music", {})
-        music_url = music.get("playUrl") or ""
 
         return {
             "title": desc or "TikTok Video",
@@ -503,12 +606,10 @@ def _parse_universal_data(data: dict) -> Optional[dict]:
             "view_count": view_count,
             "thumbnail": cover,
             "duration": duration,
-            "url": play_addr or music_url,
+            "url": play_addr,
             "formats": [],
         }
-
-    except Exception as e:
-        logger.debug("Failed to parse universal data: %s", e)
+    except Exception:
         return None
 
 
@@ -519,14 +620,12 @@ def _parse_sigi_state(data: dict) -> Optional[dict]:
         if not item_module:
             return None
 
-        # Get first video item
         first_key = next(iter(item_module), None)
         if not first_key:
             return None
 
         item = item_module[first_key]
         video = item.get("video", {})
-
         play_addr = video.get("playAddr", "")
         author_name = item.get("author", "")
         desc = item.get("desc", "")
@@ -546,9 +645,7 @@ def _parse_sigi_state(data: dict) -> Optional[dict]:
             "url": play_addr,
             "formats": [],
         }
-
-    except Exception as e:
-        logger.debug("Failed to parse SIGI_STATE: %s", e)
+    except Exception:
         return None
 
 
@@ -573,7 +670,7 @@ def _base_ydl_opts() -> dict:
 
 
 def _run_yt_dlp_blocking(url: str, ydl_opts: dict) -> Optional[dict]:
-    """Run yt-dlp in blocking mode (called via asyncio.to_thread)."""
+    """Run yt-dlp in blocking mode."""
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(url, download=False)
@@ -600,7 +697,7 @@ def _normalise_single_info(info: dict, canonical_url: str) -> dict:
 def _pick_download_url(info: dict) -> str:
     """
     Select the best available video URL from yt-dlp output.
-    Filters out audio-only formats to ensure video+audio is returned.
+    Filters out audio-only formats and server-inaccessible CDN domains.
     """
     formats = info.get("formats", []) or []
 
@@ -616,23 +713,27 @@ def _pick_download_url(info: dict) -> str:
         )
         return not is_audio_only
 
-    muxed_formats = [f for f in formats if _is_muxed(f)]
-    if not muxed_formats:
-        muxed_formats = formats
+    def _is_accessible(fmt: dict) -> bool:
+        url = fmt.get("url", "")
+        return _is_server_accessible_url(url)
+
+    # Filter: must be muxed AND from accessible CDN
+    good_formats = [f for f in formats if _is_muxed(f) and _is_accessible(f)]
+
+    # If no formats pass both filters, just use muxed
+    if not good_formats:
+        good_formats = [f for f in formats if _is_muxed(f)]
+
+    # If still nothing, use all formats
+    if not good_formats:
+        good_formats = formats
 
     sorted_formats = sorted(
-        muxed_formats,
+        good_formats,
         key=lambda f: (f.get("height", 0) or 0, f.get("vbr", 0) or 0),
         reverse=True,
     )
 
-    # Look for TikTok-specific no-watermark URLs first
-    for fmt in sorted_formats:
-        url = fmt.get("url", "")
-        if url and ("no_watermark" in url.lower() or "play_addr" in url.lower()):
-            return url
-
-    # Fallback: use the best quality muxed format URL
     for fmt in sorted_formats:
         url = fmt.get("url", "")
         if url:
@@ -644,14 +745,10 @@ def _pick_download_url(info: dict) -> str:
 # ─── Bulk Profile Extraction ──────────────────────────────────────
 
 async def extract_bulk_profile(username_raw: str, delay: float = 1.0) -> dict:
-    """
-    Extract metadata for all public videos on a TikTok profile.
-    Uses TikWM API for each video URL discovered from the profile page.
-    """
+    """Extract metadata for all public videos on a TikTok profile."""
     username = normalise_username(username_raw)
     profile_url = f"https://www.tiktok.com/@{username}"
 
-    # Resolve profile page to get video URLs
     try:
         async with httpx.AsyncClient(
             follow_redirects=True,
@@ -668,22 +765,20 @@ async def extract_bulk_profile(username_raw: str, delay: float = 1.0) -> dict:
     except Exception as e:
         raise RuntimeError(f"Could not access profile {username}: {e}")
 
-    # Extract video URLs from the page
-    video_urls = re.findall(r'https?://(?:www\.)?tiktok\.com/@[^/]+/video/(\d+)', html)
-    video_urls = list(set(video_urls))
+    video_ids = re.findall(r'https?://(?:www\.)?tiktok\.com/@[^/]+/video/(\d+)', html)
+    video_ids = list(set(video_ids))
 
-    if not video_urls:
+    if not video_ids:
         raise RuntimeError(
             f"No public videos found for @{username}. The profile may be private or empty."
         )
 
-    # Extract each video using TikWM
     videos = []
-    for video_id in video_urls:
+    for video_id in video_ids:
         video_url = f"https://www.tiktok.com/@{username}/video/{video_id}"
         try:
             await asyncio.sleep(delay)
-            result = await asyncio.to_thread(_submit_tikwm_task, video_url)
+            result = await _submit_tikwm_task(video_url)
             if result and result.get("play_url"):
                 videos.append({
                     "caption": safe_caption(result.get("desc", "")),

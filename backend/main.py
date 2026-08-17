@@ -14,6 +14,7 @@ Endpoints:
 import asyncio
 import logging
 from urllib.parse import urlparse
+from typing import Optional
 
 import httpx
 from fastapi import FastAPI, HTTPException, Query, Request
@@ -28,7 +29,12 @@ from schemas.payload_models import (
     SingleDownloadRequest,
     SingleVideoResponse,
 )
-from services.tiktok_service import extract_bulk_profile, extract_single_video
+from services.tiktok_service import (
+    extract_bulk_profile,
+    extract_single_video,
+    generate_mirror_urls,
+    swap_cdn_domain,
+)
 from utils.formatters import is_valid_tiktok_url
 
 # ─── Logging ──────────────────────────────────────────────────────
@@ -223,6 +229,14 @@ async def _stream_video_from_cdn(url: str, filename: str):
                 content_type = response.headers.get("content-type", "video/mp4")
                 content_length = response.headers.get("content-length", "")
                 
+                # Check if the response is actually video content (not an HTML error page)
+                if "text/html" in content_type.lower():
+                    logger.warning(
+                        "CDN returned HTML instead of video for %s (possible redirect to 404)",
+                        url[:80],
+                    )
+                    return
+                
                 # Yield response metadata for the outer function
                 yield {
                     "_meta": True,
@@ -250,6 +264,41 @@ async def _stream_video_from_cdn(url: str, filename: str):
             logger.error("Timeout streaming from CDN: %s", url[:80])
         except Exception as e:
             logger.error("Stream error: %s — %s", e, url[:80])
+
+
+async def _probe_cdn_url(url: str) -> Optional[dict]:
+    """
+    Fast probe of a CDN URL — sends a small Range request to check if it works.
+    Returns metadata dict if successful, None if failed.
+    All mirrors are probed in parallel, so total time = fastest working mirror.
+    """
+    headers = _get_cdn_headers()
+    
+    try:
+        async with httpx.AsyncClient(
+            timeout=8.0,  # Short timeout for probing
+            follow_redirects=True,
+            headers=headers,
+        ) as client:
+            async with client.stream("GET", url) as response:
+                if response.status_code in (403, 404, 500):
+                    return None
+                
+                content_type = response.headers.get("content-type", "video/mp4")
+                content_length = response.headers.get("content-length", "")
+                
+                # Reject HTML error pages
+                if "text/html" in content_type.lower():
+                    return None
+                
+                return {
+                    "_meta": True,
+                    "content_type": content_type,
+                    "content_length": content_length,
+                    "status_code": response.status_code,
+                }
+    except Exception:
+        return None
 
 
 @app.api_route("/api/proxy-download", methods=["GET", "HEAD"], tags=["Download"])
@@ -292,35 +341,50 @@ async def proxy_download(
     
     filename = "tiktok_video_nowatermark.mp4"
     
-    stream_gen = _stream_video_from_cdn(url, filename)
+    # Try the original URL first, then fall back to CDN mirrors (in parallel)
+    urls_to_try = [url]
+    urls_to_try.extend(generate_mirror_urls(url))
     
-    # Get metadata from first yield (handle StopAsyncIteration if generator is empty)
+    # Phase 1: Probe all URLs in parallel (fast, small requests)
+    # This tests all mirrors at the same time — total time = time of the fastest working one
+    probe_results = await asyncio.gather(
+        *[_probe_cdn_url(u) for u in urls_to_try],
+        return_exceptions=True,
+    )
+    
+    # Find the first working URL
+    working_url = None
+    meta = None
+    for i, result in enumerate(probe_results):
+        if isinstance(result, dict) and result.get("_meta"):
+            working_url = urls_to_try[i]
+            meta = result
+            break
+    
+    if working_url is None:
+        raise HTTPException(
+            status_code=502,
+            detail="Failed to connect to video source. The CDN link may have expired or is blocked. Please try extracting the video again.",
+        )
+    
+    if working_url != url:
+        logger.info("Using CDN mirror: %s (original was %s)", working_url[:80], url[:80])
+    
+    content_type = meta.get("content_type", "video/mp4")
+    content_length = meta.get("content_length", "")
+    status_code = meta.get("status_code", 200)
+    
+    # Phase 2: Stream the full video from the working URL
+    final_gen = _stream_video_from_cdn(working_url, filename)
+    
+    # Skip the meta yield from the new generator
     try:
-        first_yield = await stream_gen.__anext__()
+        await final_gen.__anext__()
     except StopAsyncIteration:
-        raise HTTPException(
-            status_code=502,
-            detail="Failed to connect to video source. Please try extracting the video again.",
-        )
-    
-    if not isinstance(first_yield, dict) or not first_yield.get("_meta"):
-        raise HTTPException(
-            status_code=502,
-            detail="Failed to connect to video source. Please try again.",
-        )
-    
-    content_type = first_yield.get("content_type", "video/mp4")
-    content_length = first_yield.get("content_length", "")
-    status_code = first_yield.get("status_code", 200)
-    
-    if status_code in (403, 404):
-        raise HTTPException(
-            status_code=502,
-            detail="Video source rejected the request. The CDN link may have expired. Please try extracting again.",
-        )
+        pass
     
     async def video_stream():
-        async for chunk in stream_gen:
+        async for chunk in final_gen:
             yield chunk
     
     response_headers = {
