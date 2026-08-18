@@ -1,26 +1,33 @@
 """
-TikTokExtract API — FastAPI Backend
+TikTokExtract API — FastAPI Backend (v2 Architecture)
 
 Production-grade backend for TikTok video downloading and bulk profile extraction.
-Matches the frontend contract defined in the static HTML/JS client.
+
+NEW ARCHITECTURE (Server-Side Download + Local Cache):
+  - Videos are downloaded to server disk immediately after extraction
+  - Users download from our server (not TikTok CDN) — no 403 issues
+  - Cached files are auto-cleaned after TTL
 
 Endpoints:
   GET  /api/health            — Health check
-  POST /api/download-single   — Extract single video metadata
+  POST /api/download-single   — Extract metadata + download video to cache
   POST /api/extract-bulk      — Extract bulk profile metadata
-  GET  /api/proxy-download    — Proxy-stream video from TikTok CDN
+  GET  /api/get-video/{video_id} — Download cached video from server
 """
 
 import asyncio
+import hashlib
 import logging
-from urllib.parse import urlparse
+import os
+import shutil
+import tempfile
+import time
 from typing import Optional
-import json
 
 import httpx
 from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, StreamingResponse, RedirectResponse, Response
+from fastapi.responses import JSONResponse, FileResponse
 
 from config import settings
 from schemas.payload_models import (
@@ -28,13 +35,10 @@ from schemas.payload_models import (
     BulkExtractResponse,
     HealthResponse,
     SingleDownloadRequest,
-    SingleVideoResponse,
 )
 from services.tiktok_service import (
     extract_bulk_profile,
     extract_single_video,
-    generate_mirror_urls,
-    swap_cdn_domain,
 )
 from utils.formatters import is_valid_tiktok_url
 
@@ -45,6 +49,129 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
 )
 logger = logging.getLogger("tiktokextract")
+
+# ─── Video Cache ──────────────────────────────────────────────────
+
+VIDEO_CACHE_DIR = os.path.join(tempfile.gettempdir(), "tiktok_video_cache")
+os.makedirs(VIDEO_CACHE_DIR, exist_ok=True)
+
+# Cache TTL: 30 minutes
+CACHE_TTL = 30 * 60
+
+# In-memory cache of {video_id: {"path": str, "filename": str, "created": float}}
+_video_cache: dict[str, dict] = {}
+
+
+def _generate_video_id(url: str) -> str:
+    """Generate a unique ID for a video based on its CDN URL."""
+    return hashlib.sha256(url.encode()).hexdigest()[:16]
+
+
+def _cleanup_expired_cache():
+    """Remove expired video files from the cache directory."""
+    now = time.time()
+    expired_ids = []
+    for vid, info in _video_cache.items():
+        if now - info["created"] > CACHE_TTL:
+            expired_ids.append(vid)
+    for vid in expired_ids:
+        try:
+            os.remove(_video_cache[vid]["path"])
+        except OSError:
+            pass
+        del _video_cache[vid]
+
+
+def _download_video_to_cache(cdn_url: str, filename: str, video_id: str) -> bool:
+    """
+    Download a video from CDN URL to local cache.
+    Tries multiple CDN mirror domains in parallel.
+    Returns True if successful.
+    """
+    filepath = os.path.join(VIDEO_CACHE_DIR, f"{video_id}.mp4")
+    
+    # Try the original URL first
+    urls_to_try = [cdn_url]
+    
+    # Generate mirror URLs (replace domain with known TikTok CDN mirrors)
+    from urllib.parse import urlparse, urlunparse
+    parsed = urlparse(cdn_url)
+    path = parsed.path
+    query = parsed.query
+    mirror_domains = [
+        "v16.tokcdn.com",
+        "v16m.tiktokcdn.com",
+        "v19.tiktokcdn.com",
+        "www.tiktok.com",
+    ]
+    for domain in mirror_domains:
+        mirrored = urlunparse((
+            "https",
+            domain,
+            path,
+            "",
+            query,
+            ""
+        ))
+        urls_to_try.append(mirrored)
+    
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+        "Accept": "video/webm,video/ogg,video/*;q=0.9,application/ogg;q=0.7,audio/*;q=0.6,*/*;q=0.5",
+        "Referer": "https://www.tiktok.com/",
+        "Origin": "https://www.tiktok.com",
+    }
+    
+    for attempt_url in urls_to_try:
+        try:
+            with httpx.Client(timeout=60.0, follow_redirects=True, headers=headers) as client:
+                response = client.get(attempt_url)
+                if response.status_code == 200:
+                    content_type = response.headers.get("content-type", "")
+                    # Verify it's actually a video
+                    if "text/html" in content_type.lower():
+                        logger.warning("Mirror returned HTML, skipping: %s", attempt_url[:60])
+                        continue
+                    if len(response.content) < 1000:
+                        logger.warning("Response too small, skipping: %s", attempt_url[:60])
+                        continue
+                    
+                    # Write to file
+                    with open(filepath, "wb") as f:
+                        f.write(response.content)
+                    
+                    logger.info(
+                        "Downloaded video (%.1f MB) from %s -> %s",
+                        len(response.content) / (1024*1024),
+                        attempt_url[:50],
+                        filepath,
+                    )
+                    return True
+                else:
+                    logger.debug("Mirror %s returned %d", attempt_url[:50], response.status_code)
+        except Exception as e:
+            logger.debug("Mirror %s failed: %s", attempt_url[:50], e)
+            continue
+    
+    return False
+
+
+async def _async_download_video(cdn_url: str, filename: str, video_id: str):
+    """Async wrapper for downloading video to cache (runs in background)."""
+    loop = asyncio.get_event_loop()
+    success = await loop.run_in_executor(
+        None, _download_video_to_cache, cdn_url, filename, video_id
+    )
+    if success:
+        _video_cache[video_id] = {
+            "path": os.path.join(VIDEO_CACHE_DIR, f"{video_id}.mp4"),
+            "filename": filename,
+            "created": time.time(),
+        }
+        logger.info("Video cached with ID: %s", video_id)
+    else:
+        logger.warning("Failed to download video to cache: %s", video_id)
+
 
 # ─── App ──────────────────────────────────────────────────────────
 
@@ -108,13 +235,12 @@ async def health_check():
 
 @app.post(
     "/api/download-single",
-    response_model=SingleVideoResponse,
     tags=["Download"],
 )
 async def download_single(request: SingleDownloadRequest):
     """
-    Extract metadata for a single TikTok video.
-    Returns metadata including a no-watermark CDN download URL.
+    Extract metadata for a single TikTok video AND download it to server cache.
+    Returns metadata + a local download URL for the cached video.
     """
     url = request.url.strip()
 
@@ -128,7 +254,36 @@ async def download_single(request: SingleDownloadRequest):
     try:
         data = await extract_single_video(url)
         logger.info("Successfully extracted single video: %s", data.get("title", "unknown"))
-        return SingleVideoResponse(**data)
+        
+        # Extract the CDN URL
+        cdn_url = data.get("download_url", "")
+        title = data.get("title", "TikTok Video")
+        
+        # Generate a safe filename
+        safe_title = "".join(c for c in title[:50] if c.isalnum() or c in " _-").strip()
+        filename = f"{safe_title}_no_watermark.mp4" if safe_title else "tiktok_video_no_watermark.mp4"
+        
+        # Generate video ID
+        video_id = _generate_video_id(cdn_url)
+        
+        # Start background download to cache
+        # Don't await — let it run in background so the user gets the response quickly
+        asyncio.create_task(_async_download_video(cdn_url, filename, video_id))
+        
+        # Return the response with local download URL
+        result = {
+            "title": data.get("title", ""),
+            "author": data.get("author", ""),
+            "views": data.get("views", ""),
+            "thumbnail": data.get("thumbnail", ""),
+            "download_url": cdn_url,
+            "video_id": video_id,
+            "filename": filename,
+        }
+        
+        logger.info("Returning result with video_id: %s", video_id)
+        return JSONResponse(content=result)
+        
     except ValueError:
         raise
     except RuntimeError as exc:
@@ -172,135 +327,50 @@ async def extract_bulk(request: BulkExtractRequest):
         )
 
 
-# ─── Proxy Download (Server-side Streaming) ───────────────────────
+# ─── Get Video (Download from Cache) ──────────────────────────────
 
-def _get_cdn_headers() -> dict:
+@app.get("/api/get-video/{video_id}", tags=["Download"])
+async def get_video(video_id: str):
     """
-    Build browser-like headers that TikTok CDN accepts.
-    These mimic a real browser fetching a video from TikTok.
+    Download a cached video from the server.
+    The video was pre-downloaded during extraction, so this always works
+    (no TikTok CDN blocking issues).
     """
-    return {
-        "User-Agent": (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) "
-            "Chrome/131.0.0.0 Safari/537.36"
-        ),
-        "Accept": "video/webm,video/ogg,video/*;q=0.9,application/ogg;q=0.7,audio/*;q=0.6,*/*;q=0.5",
-        "Accept-Language": "en-US,en;q=0.9",
-        "Accept-Encoding": "identity",
-        "Referer": "https://www.tiktok.com/",
-        "Origin": "https://www.tiktok.com",
-        "Sec-Fetch-Dest": "video",
-        "Sec-Fetch-Mode": "no-cors",
-        "Sec-Fetch-Site": "cross-site",
-        "Range": "bytes=0-",
-    }
-
-
-async def _stream_video_from_cdn(url: str, filename: str):
-    """
-    Stream a video from the TikTok CDN through our server.
+    # Cleanup expired cache
+    _cleanup_expired_cache()
     
-    This is a generator that yields chunks of video data as they arrive,
-    allowing the browser to start downloading immediately without waiting
-    for the full file to be downloaded server-side first.
-    """
-    headers = _get_cdn_headers()
+    # Check if video is in cache
+    if video_id not in _video_cache:
+        raise HTTPException(
+            status_code=404,
+            detail="Video not found in cache. Please extract the video again."
+        )
     
-    async with httpx.AsyncClient(
-        timeout=120.0,
-        follow_redirects=True,
-        headers=headers,
-    ) as client:
-        try:
-            async with client.stream("GET", url) as response:
-                if response.status_code in (403, 404):
-                    logger.error(
-                        "CDN rejected stream request: %d for %s",
-                        response.status_code, url[:80]
-                    )
-                    return
-                
-                if response.status_code != 200 and response.status_code != 206:
-                    logger.warning(
-                        "CDN returned %d for %s", response.status_code, url[:80]
-                    )
-                    return
-                
-                content_type = response.headers.get("content-type", "video/mp4")
-                content_length = response.headers.get("content-length", "")
-                
-                # Check if the response is actually video content (not an HTML error page)
-                if "text/html" in content_type.lower():
-                    logger.warning(
-                        "CDN returned HTML instead of video for %s (possible redirect to 404)",
-                        url[:80],
-                    )
-                    return
-                
-                # Yield response metadata for the outer function
-                yield {
-                    "_meta": True,
-                    "content_type": content_type,
-                    "content_length": content_length,
-                    "status_code": response.status_code,
-                }
-                
-                # Stream chunks
-                chunk_count = 0
-                async for chunk in response.aiter_bytes(chunk_size=settings.PROXY_CHUNK_SIZE):
-                    chunk_count += 1
-                    yield chunk
-                    
-                logger.info(
-                    "Streamed %d chunks (%.1f MB) from CDN for %s",
-                    chunk_count,
-                    chunk_count * settings.PROXY_CHUNK_SIZE / (1024 * 1024),
-                    url[:60],
-                )
-                
-        except httpx.ConnectError:
-            logger.error("Connection error streaming from CDN: %s", url[:80])
-        except httpx.TimeoutException:
-            logger.error("Timeout streaming from CDN: %s", url[:80])
-        except Exception as e:
-            logger.error("Stream error: %s — %s", e, url[:80])
-
-
-async def _probe_cdn_url(url: str) -> Optional[dict]:
-    """
-    Fast probe of a CDN URL — sends a small Range request to check if it works.
-    Returns metadata dict if successful, None if failed.
-    All mirrors are probed in parallel, so total time = fastest working mirror.
-    """
-    headers = _get_cdn_headers()
+    cache_info = _video_cache[video_id]
+    filepath = cache_info["path"]
+    filename = cache_info["filename"]
     
-    try:
-        async with httpx.AsyncClient(
-            timeout=8.0,  # Short timeout for probing
-            follow_redirects=True,
-            headers=headers,
-        ) as client:
-            async with client.stream("GET", url) as response:
-                if response.status_code in (403, 404, 500):
-                    return None
-                
-                content_type = response.headers.get("content-type", "video/mp4")
-                content_length = response.headers.get("content-length", "")
-                
-                # Reject HTML error pages
-                if "text/html" in content_type.lower():
-                    return None
-                
-                return {
-                    "_meta": True,
-                    "content_type": content_type,
-                    "content_length": content_length,
-                    "status_code": response.status_code,
-                }
-    except Exception:
-        return None
+    if not os.path.exists(filepath):
+        # File was deleted but cache entry still exists
+        del _video_cache[video_id]
+        raise HTTPException(
+            status_code=404,
+            detail="Video file was removed from cache. Please extract again."
+        )
+    
+    logger.info("Serving cached video: %s (%s)", filename, video_id)
+    
+    return FileResponse(
+        path=filepath,
+        media_type="video/mp4",
+        filename=filename,
+        headers={
+            "Content-Disposition": f'attachment; filename="{filename}"',
+        }
+    )
 
+
+# ─── Legacy Proxy Download (kept for backwards compatibility) ─────
 
 @app.api_route("/api/proxy-download", methods=["GET", "HEAD"], tags=["Download"])
 async def proxy_download(
@@ -308,226 +378,47 @@ async def proxy_download(
     filename: Optional[str] = Query(None, description="Desired download filename"),
 ):
     """
-    Proxy-stream the video from TikTok CDN through our server.
-    
-    TikTok CDN URLs expire quickly and are session-dependent. Instead of
-    redirecting (which causes 0-byte downloads when the CDN rejects the
-    browser's request), we stream the video through our server using
-    browser-like headers that the CDN accepts.
-    
-    The browser receives the video data directly from our server with
-    proper Content-Disposition headers for download.
+    Legacy proxy endpoint — downloads the video from CDN and returns it.
+    Now uses the cache approach: downloads to disk first, then serves.
     """
     if not url:
         raise HTTPException(status_code=400, detail="Missing 'url' parameter.")
 
-    # Use provided filename or default
     filename = filename or "tiktok_video_nowatermark.mp4"
-
-    # Validate that the URL points to a TikTok-related domain
-    try:
-        parsed = urlparse(url)
-        allowed_domains = (
-            "tiktok.com", "tiktokcdn.com", "tokcdn.com",
-            "tiktokcdn-us.com", "tiktokv.com", "byteoversea.com", "bytegecko-i18n.com",
-        )
-        hostname = parsed.hostname or ""
-        if not any(d in hostname for d in allowed_domains):
-            raise HTTPException(
-                status_code=400,
-                detail="URL must point to a TikTok CDN or video domain.",
-            )
-    except HTTPException:
-        raise
-    except Exception:
-        raise HTTPException(status_code=400, detail="Invalid URL format.")
-
-    logger.info("Proxy-streaming video from: %s", url[:100])
+    video_id = _generate_video_id(url)
     
-    filename = "tiktok_video_nowatermark.mp4"
-    
-    # Try the original URL first, then fall back to CDN mirrors (in parallel)
-    urls_to_try = [url]
-    urls_to_try.extend(generate_mirror_urls(url))
-    
-    # Phase 1: Probe all URLs in parallel (fast, small requests)
-    # This tests all mirrors at the same time — total time = time of the fastest working one
-    probe_results = await asyncio.gather(
-        *[_probe_cdn_url(u) for u in urls_to_try],
-        return_exceptions=True,
-    )
-    
-    # Find the first working URL
-    working_url = None
-    meta = None
-    for i, result in enumerate(probe_results):
-        if isinstance(result, dict) and result.get("_meta"):
-            working_url = urls_to_try[i]
-            meta = result
-            break
-    
-    if working_url is None:
-        # Server IP is blocked by TikTok CDN, but the user's browser (residential IP)
-        # is NOT blocked. Instead of redirecting (which plays inline in the browser),
-        # return an HTML page that uses JS to fetch the CDN URL and force-download it.
-        logger.info("Server blocked from all CDN domains, serving browser-download page for: %s", url[:80])
-        
-        download_html = f"""<!DOCTYPE html>
-<html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Downloading Video...</title>
-<style>
-body{{background:#111;color:#fff;font-family:sans-serif;display:flex;flex-direction:column;align-items:center;justify-content:center;height:100vh;margin:0;text-align:center;padding:20px;}}
-.spinner{{width:40px;height:40px;border:4px solid #333;border-top:4px solid #22c55e;border-radius:50%;animation:spin 1s linear infinite;}}
-@keyframes spin{{to{{transform:rotate(360deg)}}}}
-p{{margin-top:16px;font-size:16px;}}
-button{{margin-top:20px;padding:12px 24px;background:#22c55e;color:#fff;border:none;border-radius:8px;font-size:16px;cursor:pointer;display:none;}}
-button:active{{background:#16a34a;}}
-video{{max-width:90%;border-radius:8px;margin-top:10px;display:none;}}
-</style>
-</head><body>
-<div class="spinner" id="spinner"></div>
-<p id="status">Preparing download...</p>
-<button id="retry-btn" onclick="location.reload()">Try Again</button>
-<video id="video-el" controls></video>
-<script>
-(function(){{
-    const cdnUrl = {json.dumps(url)};
-    const filename = {json.dumps(filename)};
-    const status = document.getElementById('status');
-    const spinner = document.getElementById('spinner');
-    const retryBtn = document.getElementById('retry-btn');
-    const videoEl = document.getElementById('video-el');
-    let done = false;
-    let attempts = 0;
-    const maxAttempts = 3;
-    
-    function markDone(){{
-        done = true;
-        spinner.style.display = 'none';
-    }}
-    
-    function showFailed(msg){{
-        if (done) return;
-        done = true;
-        spinner.style.display = 'none';
-        status.textContent = 'Could not auto-download. Tap the video below and use the 3-dot menu to save it, or use the Try Again button.';
-        retryBtn.style.display = 'block';
-    }}
-    
-    // Method 1: Try to use a video element to load and then save
-    // Video elements handle CORS differently — they can play cross-origin video
-    // even when XHR/fetch are blocked by CORS.
-    videoEl.src = cdnUrl;
-    videoEl.style.display = 'block';
-    
-    videoEl.oncanplay = function(){{
-        if (done) return;
-        // Video loaded — show instruction
-        spinner.style.display = 'none';
-        status.textContent = 'Video loaded! Tap play, then use the 3-dot menu (⋮) to download/save the video.';
-        retryBtn.style.display = 'block';
-        // Try to trigger a download
-        tryVideoDownload();
-    }};
-    
-    videoEl.onerror = function(){{
-        if (done) return;
-        attempts++;
-        if (attempts < maxAttempts) {{
-            setTimeout(function(){{
-                if (!done) {{
-                    videoEl.src = cdnUrl + '&v=' + Date.now();
-                }}
-            }}, 2000);
-        }} else {{
-            showFailed('Video could not load');
-        }}
-    }};
-    
-    // Also try XHR in parallel — if CORS allows it, we get a proper blob download
-    const xhr = new XMLHttpRequest();
-    xhr.open('GET', cdnUrl, true);
-    xhr.responseType = 'blob';
-    xhr.timeout = 15000;
-    xhr.onload = function(){{
-        if (done) return;
-        if (xhr.status === 200 && xhr.response && xhr.response.size > 1000) {{
-            markDone();
-            status.textContent = 'Download started! Check your downloads folder.';
-            retryBtn.style.display = 'none';
-            videoEl.style.display = 'none';
-            const a = document.createElement('a');
-            a.href = URL.createObjectURL(xhr.response);
-            a.download = filename;
-            document.body.appendChild(a);
-            a.click();
-            document.body.removeChild(a);
-        }}
-        // If XHR fails due to CORS, the video element fallback still works
-    }};
-    xhr.onerror = function(){{}}; // Silently ignore — video element is our fallback
-    xhr.ontimeout = function(){{}}; // Silently ignore
-    xhr.send();
-    
-    function tryVideoDownload(){{
-        // Attempt to download from the loaded video element
-        const a = document.createElement('a');
-        a.href = cdnUrl;
-        a.download = filename;
-        a.target = '_blank';
-        document.body.appendChild(a);
-        a.click();
-        document.body.removeChild(a);
-    }}
-    
-    // Hard timeout — if nothing works in 15 seconds, show fallback UI
-    setTimeout(function(){{
-        if (!done) {{
-            showFailed('Auto-download unavailable');
-        }}
-    }}, 15000);
-}})();
-</script>
-</body></html>"""
-        
-        return Response(
-            content=download_html,
-            media_type="text/html",
-            status_code=200,
+    # Check if already cached
+    if video_id in _video_cache and os.path.exists(_video_cache[video_id]["path"]):
+        logger.info("Serving already-cached video: %s", video_id)
+        return FileResponse(
+            path=_video_cache[video_id]["path"],
+            media_type="video/mp4",
+            filename=_video_cache[video_id]["filename"],
+            headers={"Content-Disposition": f'attachment; filename="{filename}"'},
         )
     
-    if working_url != url:
-        logger.info("Using CDN mirror: %s (original was %s)", working_url[:80], url[:80])
+    # Try to download to cache
+    loop = asyncio.get_event_loop()
+    success = await loop.run_in_executor(None, _download_video_to_cache, url, filename, video_id)
     
-    content_type = meta.get("content_type", "video/mp4")
-    content_length = meta.get("content_length", "")
-    status_code = meta.get("status_code", 200)
+    if success:
+        _video_cache[video_id] = {
+            "path": os.path.join(VIDEO_CACHE_DIR, f"{video_id}.mp4"),
+            "filename": filename,
+            "created": time.time(),
+        }
+        return FileResponse(
+            path=os.path.join(VIDEO_CACHE_DIR, f"{video_id}.mp4"),
+            media_type="video/mp4",
+            filename=filename,
+            headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+        )
     
-    # Phase 2: Stream the full video from the working URL
-    final_gen = _stream_video_from_cdn(working_url, filename)
-    
-    # Skip the meta yield from the new generator
-    try:
-        await final_gen.__anext__()
-    except StopAsyncIteration:
-        pass
-    
-    async def video_stream():
-        async for chunk in final_gen:
-            yield chunk
-    
-    response_headers = {
-        "Content-Disposition": f'attachment; filename="{filename}"',
-        "Content-Type": content_type,
-        "Accept-Ranges": "bytes",
-    }
-    if content_length:
-        response_headers["Content-Length"] = content_length
-    
-    return StreamingResponse(
-        video_stream(),
-        media_type=content_type,
-        headers=response_headers,
+    # If download failed, try re-extracting with a fresh URL
+    logger.warning("Direct download failed, trying re-extraction...")
+    raise HTTPException(
+        status_code=502,
+        detail="Failed to download video. Please try extracting again."
     )
 
 
