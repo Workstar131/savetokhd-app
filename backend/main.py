@@ -382,11 +382,13 @@ body{{background:#111;color:#fff;font-family:sans-serif;display:flex;flex-direct
 p{{margin-top:16px;font-size:16px;}}
 button{{margin-top:20px;padding:12px 24px;background:#22c55e;color:#fff;border:none;border-radius:8px;font-size:16px;cursor:pointer;display:none;}}
 button:active{{background:#16a34a;}}
+video{{max-width:90%;border-radius:8px;margin-top:10px;display:none;}}
 </style>
 </head><body>
 <div class="spinner" id="spinner"></div>
 <p id="status">Preparing download...</p>
 <button id="retry-btn" onclick="location.reload()">Try Again</button>
+<video id="video-el" controls></video>
 <script>
 (function(){{
     const cdnUrl = {json.dumps(url)};
@@ -394,66 +396,96 @@ button:active{{background:#16a34a;}}
     const status = document.getElementById('status');
     const spinner = document.getElementById('spinner');
     const retryBtn = document.getElementById('retry-btn');
+    const videoEl = document.getElementById('video-el');
+    let done = false;
+    let attempts = 0;
+    const maxAttempts = 3;
     
-    // Try multiple methods to download the video
-    // Method 1: XHR with responseType blob (best cross-origin support)
-    tryDownloadXHR();
-    
-    function tryDownloadXHR(){{
-        const xhr = new XMLHttpRequest();
-        xhr.open('GET', cdnUrl, true);
-        xhr.responseType = 'blob';
-        xhr.timeout = 30000;
-        xhr.onload = function(){{
-            if (xhr.status === 200 && xhr.response && xhr.response.size > 1000) {{
-                const a = document.createElement('a');
-                a.href = URL.createObjectURL(xhr.response);
-                a.download = filename;
-                document.body.appendChild(a);
-                a.click();
-                document.body.removeChild(a);
-                spinner.style.display = 'none';
-                status.textContent = 'Download started! Check your downloads.';
-            }} else {{
-                tryFallback();
-            }}
-        }};
-        xhr.onerror = tryFallback;
-        xhr.ontimeout = tryFallback;
-        xhr.send();
-    }}
-    
-    function tryFallback(){{
-        // Method 2: Direct navigation with download attribute
-        // Some browsers will save the file when navigating to a video URL
-        try {{
-            const a = document.createElement('a');
-            a.href = cdnUrl;
-            a.download = filename;
-            a.target = '_blank';
-            document.body.appendChild(a);
-            a.click();
-            document.body.removeChild(a);
-            spinner.style.display = 'none';
-            status.textContent = 'Opening video... Save it using your browser\'s options (long-press or share menu).';
-            retryBtn.style.display = 'block';
-        }} catch(e) {{
-            showFailed(e.message);
-        }}
+    function markDone(){{
+        done = true;
+        spinner.style.display = 'none';
     }}
     
     function showFailed(msg){{
+        if (done) return;
+        done = true;
         spinner.style.display = 'none';
-        status.textContent = 'Download failed: ' + msg + '. The link may have expired. Please try extracting again.';
+        status.textContent = 'Could not auto-download. Tap the video below and use the 3-dot menu to save it, or use the Try Again button.';
         retryBtn.style.display = 'block';
     }}
     
-    // Timeout after 30 seconds
-    setTimeout(function(){{
-        if (spinner.style.display !== 'none') {{
-            showFailed('Connection timed out');
+    // Method 1: Try to use a video element to load and then save
+    // Video elements handle CORS differently — they can play cross-origin video
+    // even when XHR/fetch are blocked by CORS.
+    videoEl.src = cdnUrl;
+    videoEl.style.display = 'block';
+    
+    videoEl.oncanplay = function(){{
+        if (done) return;
+        // Video loaded — show instruction
+        spinner.style.display = 'none';
+        status.textContent = 'Video loaded! Tap play, then use the 3-dot menu (⋮) to download/save the video.';
+        retryBtn.style.display = 'block';
+        // Try to trigger a download
+        tryVideoDownload();
+    }};
+    
+    videoEl.onerror = function(){{
+        if (done) return;
+        attempts++;
+        if (attempts < maxAttempts) {{
+            setTimeout(function(){{
+                if (!done) {{
+                    videoEl.src = cdnUrl + '&v=' + Date.now();
+                }}
+            }}, 2000);
+        }} else {{
+            showFailed('Video could not load');
         }}
-    }}, 30000);
+    }};
+    
+    // Also try XHR in parallel — if CORS allows it, we get a proper blob download
+    const xhr = new XMLHttpRequest();
+    xhr.open('GET', cdnUrl, true);
+    xhr.responseType = 'blob';
+    xhr.timeout = 15000;
+    xhr.onload = function(){{
+        if (done) return;
+        if (xhr.status === 200 && xhr.response && xhr.response.size > 1000) {{
+            markDone();
+            status.textContent = 'Download started! Check your downloads folder.';
+            retryBtn.style.display = 'none';
+            videoEl.style.display = 'none';
+            const a = document.createElement('a');
+            a.href = URL.createObjectURL(xhr.response);
+            a.download = filename;
+            document.body.appendChild(a);
+            a.click();
+            document.body.removeChild(a);
+        }}
+        // If XHR fails due to CORS, the video element fallback still works
+    }};
+    xhr.onerror = function(){{}}; // Silently ignore — video element is our fallback
+    xhr.ontimeout = function(){{}}; // Silently ignore
+    xhr.send();
+    
+    function tryVideoDownload(){{
+        // Attempt to download from the loaded video element
+        const a = document.createElement('a');
+        a.href = cdnUrl;
+        a.download = filename;
+        a.target = '_blank';
+        document.body.appendChild(a);
+        a.click();
+        document.body.removeChild(a);
+    }}
+    
+    // Hard timeout — if nothing works in 15 seconds, show fallback UI
+    setTimeout(function(){{
+        if (!done) {{
+            showFailed('Auto-download unavailable');
+        }}
+    }}, 15000);
 }})();
 </script>
 </body></html>"""
