@@ -15,11 +15,12 @@ import asyncio
 import logging
 from urllib.parse import urlparse
 from typing import Optional
+import json
 
 import httpx
 from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, StreamingResponse, RedirectResponse
+from fastapi.responses import JSONResponse, StreamingResponse, RedirectResponse, Response
 
 from config import settings
 from schemas.payload_models import (
@@ -304,6 +305,7 @@ async def _probe_cdn_url(url: str) -> Optional[dict]:
 @app.api_route("/api/proxy-download", methods=["GET", "HEAD"], tags=["Download"])
 async def proxy_download(
     url: str = Query(..., description="Encoded TikTok CDN video URL"),
+    filename: Optional[str] = Query(None, description="Desired download filename"),
 ):
     """
     Proxy-stream the video from TikTok CDN through our server.
@@ -318,6 +320,9 @@ async def proxy_download(
     """
     if not url:
         raise HTTPException(status_code=400, detail="Missing 'url' parameter.")
+
+    # Use provided filename or default
+    filename = filename or "tiktok_video_nowatermark.mp4"
 
     # Validate that the URL points to a TikTok-related domain
     try:
@@ -363,14 +368,50 @@ async def proxy_download(
     
     if working_url is None:
         # Server IP is blocked by TikTok CDN, but the user's browser (residential IP)
-        # is NOT blocked. Redirect the browser directly to the CDN URL — the browser
-        # can access it even when the server cannot.
-        logger.info("Server blocked from all CDN domains, redirecting browser directly to: %s", url[:80])
-        # Add headers to encourage download instead of inline play
-        return RedirectResponse(
-            url=url,
-            status_code=302,
-            headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+        # is NOT blocked. Instead of redirecting (which plays inline in the browser),
+        # return an HTML page that uses JS to fetch the CDN URL and force-download it.
+        logger.info("Server blocked from all CDN domains, serving browser-download page for: %s", url[:80])
+        
+        download_html = f"""<!DOCTYPE html>
+<html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Downloading Video...</title>
+<style>
+body{{background:#111;color:#fff;font-family:sans-serif;display:flex;flex-direction:column;align-items:center;justify-content:center;height:100vh;margin:0;}}
+.spinner{{width:40px;height:40px;border:4px solid #333;border-top:4px solid #22c55e;border-radius:50%;animation:spin 1s linear infinite;}}
+@keyframes spin{{to{{transform:rotate(360deg)}}}}
+p{{margin-top:16px;font-size:16px;}}
+</style>
+</head><body>
+<div class="spinner"></div>
+<p id="status">Preparing download...</p>
+<script>
+(async function(){{
+    const cdnUrl = {json.dumps(url)};
+    const filename = {json.dumps(filename)};
+    const status = document.getElementById('status');
+    try {{
+        const resp = await fetch(cdnUrl);
+        if (!resp.ok) throw new Error('CDN returned ' + resp.status);
+        const blob = await resp.blob();
+        if (blob.size < 1000) throw new Error('File too small');
+        const a = document.createElement('a');
+        a.href = URL.createObjectURL(blob);
+        a.download = filename;
+        document.body.appendChild(a);
+        a.click();
+        document.body.removeChild(a);
+        status.textContent = 'Download started!';
+    }} catch(e) {{
+        status.textContent = 'Download failed: ' + e.message + '. The link may have expired. Please try extracting again.';
+    }}
+}})();
+</script>
+</body></html>"""
+        
+        return Response(
+            content=download_html,
+            media_type="text/html",
+            status_code=200,
         )
     
     if working_url != url:
