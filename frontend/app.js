@@ -4,7 +4,7 @@ lucide.createIcons();
 // Configuration
 const API_BASE_URL = window.location.hostname === 'localhost' || window.location.hostname === '127.0.0.1' 
     ? "http://127.0.0.1:8000/api" 
-    : "https://savetokhd-app.onrender.com/api";
+    : "https://pp.onrender.com/api";
 
 // Health Check on Load
 async function checkBackendHealth() {
@@ -159,9 +159,10 @@ function renderSingleResult(data) {
                 </div>
                 <div class="space-y-3">
                     <button id="btn-download-media"
+                            data-video-id="${escapeHTML(data.video_id || '')}"
                             data-download-url="${escapeHTML(downloadUrl)}"
                             data-original-tiktok-url="${escapeHTML(originalTikTokUrl)}"
-                            data-filename="${escapeHTML(sanitizeFilename(data.title))}"
+                            data-filename="${escapeHTML(data.filename || sanitizeFilename(data.title))}"
                             class="w-full bg-green-600 hover:bg-green-700 py-3 rounded-lg font-bold text-center transition flex items-center justify-center gap-2 text-white cursor-pointer">
                         <i data-lucide="download"></i> Download No-Watermark MP4
                     </button>
@@ -171,51 +172,59 @@ function renderSingleResult(data) {
     `;
     lucide.createIcons();
     
-    // Attach click handler for proper download
-    // Step 1: Re-fetch a FRESH CDN URL from the server (old ones expire in minutes)
-    // Step 2: Navigate to the proxy-download endpoint with the fresh URL
+    // Attach click handler — uses the new get-video endpoint
+    // The server pre-downloads the video to cache, so we just need to wait for it
     const downloadBtn = document.getElementById('btn-download-media');
-    const btnOriginalUrl = downloadBtn ? (downloadBtn.getAttribute('data-original-url') || downloadBtn.getAttribute('data-original-tiktok-url')) : null;
+    const videoId = downloadBtn ? downloadBtn.getAttribute('data-video-id') : null;
+    const filename = downloadBtn ? downloadBtn.getAttribute('data-filename') : 'tiktok_video_no_watermark.mp4';
     
-    if (downloadBtn) {
+    if (downloadBtn && videoId) {
         downloadBtn.addEventListener('click', async (e) => {
             e.preventDefault();
+            downloadBtn.disabled = true;
             
-            let finalDownloadUrl = downloadBtn.getAttribute('data-download-url');
-            const filename = downloadBtn.getAttribute('data-filename') || 'tiktok_video_no_watermark.mp4';
+            // Show preparing state
+            downloadBtn.innerHTML = '<i data-lucide="loader" class="w-5 h-5 animate-spin"></i> Preparing download...';
+            lucide.createIcons();
             
-            // Step 1: Get a fresh CDN URL by re-extracting from the original TikTok URL
-            if (btnOriginalUrl) {
-                downloadBtn.disabled = true;
-                downloadBtn.innerHTML = '<i data-lucide="loader" class="w-5 h-5 animate-spin"></i> Getting fresh link...';
-                lucide.createIcons();
-                
+            // Poll until the video is ready (max 30 seconds)
+            let attempts = 0;
+            const maxAttempts = 15;
+            const videoUrl = `${API_BASE_URL}/get-video/${encodeURIComponent(videoId)}`;
+            
+            while (attempts < maxAttempts) {
                 try {
-                    const resp = await fetch(`${API_BASE_URL}/download-single`, {
-                        method: 'POST',
-                        headers: { 'Content-Type': 'application/json' },
-                        body: JSON.stringify({ url: btnOriginalUrl })
-                    });
-                    const data = await resp.json();
-                    if (data && data.download_url) {
-                        finalDownloadUrl = data.download_url || finalDownloadUrl;
-                    } else if (data && data.data && Array.isArray(data.data) && data.data.length > 0) {
-                        finalDownloadUrl = data.data[0].download_url || data.data[0].url || finalDownloadUrl;
+                    // Use fetch with method HEAD to check if video is ready (fast, no body)
+                    const checkResp = await fetch(videoUrl, { method: 'HEAD' });
+                    if (checkResp.ok) {
+                        // Video is ready — trigger download
+                        const link = document.createElement('a');
+                        link.href = videoUrl;
+                        link.download = filename;
+                        link.style.display = 'none';
+                        document.body.appendChild(link);
+                        link.click();
+                        document.body.removeChild(link);
+                        
+                        // Reset button
+                        downloadBtn.disabled = false;
+                        downloadBtn.innerHTML = '<i data-lucide="download"></i> Download No-Watermark MP4';
+                        lucide.createIcons();
+                        return;
                     }
                 } catch (err) {
-                    console.warn('Could not re-fetch fresh URL, using cached one:', err);
+                    // Not ready yet, wait and retry
                 }
+                
+                attempts++;
+                await new Promise(resolve => setTimeout(resolve, 2000)); // Wait 2s between checks
             }
             
-            // Step 2: Navigate to proxy-download with the (hopefully fresh) URL
-            const proxyUrl = `${API_BASE_URL}/proxy-download?url=${encodeURIComponent(finalDownloadUrl)}&filename=${encodeURIComponent(filename)}`;
-            window.location.href = proxyUrl;
-            
-            setTimeout(() => {
-                downloadBtn.disabled = false;
-                downloadBtn.innerHTML = '<i data-lucide="download"></i> Download No-Watermark MP4';
-                lucide.createIcons();
-            }, 5000);
+            // Timed out — show error
+            downloadBtn.disabled = false;
+            downloadBtn.innerHTML = '<i data-lucide="download"></i> Download No-Watermark MP4';
+            lucide.createIcons();
+            showError('Video download took too long. Please try again.');
         });
     }
 }
