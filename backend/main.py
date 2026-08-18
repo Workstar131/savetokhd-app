@@ -376,34 +376,84 @@ async def proxy_download(
 <html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Downloading Video...</title>
 <style>
-body{{background:#111;color:#fff;font-family:sans-serif;display:flex;flex-direction:column;align-items:center;justify-content:center;height:100vh;margin:0;}}
+body{{background:#111;color:#fff;font-family:sans-serif;display:flex;flex-direction:column;align-items:center;justify-content:center;height:100vh;margin:0;text-align:center;padding:20px;}}
 .spinner{{width:40px;height:40px;border:4px solid #333;border-top:4px solid #22c55e;border-radius:50%;animation:spin 1s linear infinite;}}
 @keyframes spin{{to{{transform:rotate(360deg)}}}}
 p{{margin-top:16px;font-size:16px;}}
+button{{margin-top:20px;padding:12px 24px;background:#22c55e;color:#fff;border:none;border-radius:8px;font-size:16px;cursor:pointer;display:none;}}
+button:active{{background:#16a34a;}}
 </style>
 </head><body>
-<div class="spinner"></div>
+<div class="spinner" id="spinner"></div>
 <p id="status">Preparing download...</p>
+<button id="retry-btn" onclick="location.reload()">Try Again</button>
 <script>
-(async function(){{
+(function(){{
     const cdnUrl = {json.dumps(url)};
     const filename = {json.dumps(filename)};
     const status = document.getElementById('status');
-    try {{
-        const resp = await fetch(cdnUrl);
-        if (!resp.ok) throw new Error('CDN returned ' + resp.status);
-        const blob = await resp.blob();
-        if (blob.size < 1000) throw new Error('File too small');
-        const a = document.createElement('a');
-        a.href = URL.createObjectURL(blob);
-        a.download = filename;
-        document.body.appendChild(a);
-        a.click();
-        document.body.removeChild(a);
-        status.textContent = 'Download started!';
-    }} catch(e) {{
-        status.textContent = 'Download failed: ' + e.message + '. The link may have expired. Please try extracting again.';
+    const spinner = document.getElementById('spinner');
+    const retryBtn = document.getElementById('retry-btn');
+    
+    // Try multiple methods to download the video
+    // Method 1: XHR with responseType blob (best cross-origin support)
+    tryDownloadXHR();
+    
+    function tryDownloadXHR(){{
+        const xhr = new XMLHttpRequest();
+        xhr.open('GET', cdnUrl, true);
+        xhr.responseType = 'blob';
+        xhr.timeout = 30000;
+        xhr.onload = function(){{
+            if (xhr.status === 200 && xhr.response && xhr.response.size > 1000) {{
+                const a = document.createElement('a');
+                a.href = URL.createObjectURL(xhr.response);
+                a.download = filename;
+                document.body.appendChild(a);
+                a.click();
+                document.body.removeChild(a);
+                spinner.style.display = 'none';
+                status.textContent = 'Download started! Check your downloads.';
+            }} else {{
+                tryFallback();
+            }}
+        }};
+        xhr.onerror = tryFallback;
+        xhr.ontimeout = tryFallback;
+        xhr.send();
     }}
+    
+    function tryFallback(){{
+        // Method 2: Direct navigation with download attribute
+        // Some browsers will save the file when navigating to a video URL
+        try {{
+            const a = document.createElement('a');
+            a.href = cdnUrl;
+            a.download = filename;
+            a.target = '_blank';
+            document.body.appendChild(a);
+            a.click();
+            document.body.removeChild(a);
+            spinner.style.display = 'none';
+            status.textContent = 'Opening video... Save it using your browser\'s options (long-press or share menu).';
+            retryBtn.style.display = 'block';
+        }} catch(e) {{
+            showFailed(e.message);
+        }}
+    }}
+    
+    function showFailed(msg){{
+        spinner.style.display = 'none';
+        status.textContent = 'Download failed: ' + msg + '. The link may have expired. Please try extracting again.';
+        retryBtn.style.display = 'block';
+    }}
+    
+    // Timeout after 30 seconds
+    setTimeout(function(){{
+        if (spinner.style.display !== 'none') {{
+            showFailed('Connection timed out');
+        }}
+    }}, 30000);
 }})();
 </script>
 </body></html>"""
