@@ -173,6 +173,8 @@ function renderSingleResult(data) {
     lucide.createIcons();
     
     // Attach click handler for proper download
+    // Use an <a> tag with download attribute — avoids CORS issues entirely
+    // and forces the browser to save the file instead of playing inline.
     const downloadBtn = document.getElementById('btn-download-media');
     if (downloadBtn) {
         downloadBtn.addEventListener('click', (e) => {
@@ -182,50 +184,33 @@ function renderSingleResult(data) {
                 alert('No download URL available.');
                 return;
             }
-            // Use fetch with blob — the browser follows any 302 redirects automatically.
-            // This works better than window.location.href because it triggers a proper
-            // download (not inline video playback) and works on mobile browsers.
+            
             const filename = downloadBtn.getAttribute('data-filename') || 'tiktok_video_no_watermark.mp4';
             const proxyUrl = `${API_BASE_URL}/proxy-download?url=${encodeURIComponent(videoUrl)}`;
             
-            downloadBtn.disabled = true;
-            downloadBtn.innerHTML = '<i data-lucide="loader" class="w-5 h-5 animate-spin"></i> Preparing...';
-            lucide.createIcons();
+            // Create an anchor element with the download attribute
+            // This navigates the browser to our proxy endpoint which:
+            // 1. Tries to stream the video directly (if server can access CDN)
+            // 2. Falls back to 302 redirect to CDN (browser can access it directly)
+            // The 'download' attribute forces save-as behavior in most browsers.
+            const a = document.createElement('a');
+            a.href = proxyUrl;
+            a.download = filename;
+            a.target = '_self';
+            a.rel = 'noopener';
+            document.body.appendChild(a);
+            a.click();
+            document.body.removeChild(a);
             
-            fetch(proxyUrl)
-                .then(response => {
-                    if (!response.ok) {
-                        // If server proxy failed (502), the browser should follow the redirect
-                        // to the CDN URL directly. The browser can access TikTok CDN even when
-                        // the server cannot (residential IP vs datacenter IP).
-                        throw new Error('Server proxy failed, trying direct CDN...');
-                    }
-                    return response.blob();
-                })
-                .then(blob => {
-                    if (blob.size < 1000) {
-                        throw new Error('Download returned empty or invalid file. The video link may have expired. Please try extracting again.');
-                    }
-                    const url = URL.createObjectURL(blob);
-                    const a = document.createElement('a');
-                    a.href = url;
-                    a.download = filename;
-                    a.style.visibility = 'hidden';
-                    document.body.appendChild(a);
-                    a.click();
-                    document.body.removeChild(a);
-                    URL.revokeObjectURL(url);
-                    downloadBtn.disabled = false;
-                    downloadBtn.innerHTML = '<i data-lucide="download"></i> Download No-Watermark MP4';
-                    lucide.createIcons();
-                })
-                .catch(err => {
-                    downloadBtn.disabled = false;
-                    downloadBtn.innerHTML = '<i data-lucide="download"></i> Download No-Watermark MP4';
-                    lucide.createIcons();
-                    // Fallback: open in new tab — browser follows redirect to CDN
-                    window.open(proxyUrl, '_blank');
-                });
+            // Also hide the button temporarily to prevent double-clicks
+            downloadBtn.disabled = true;
+            downloadBtn.innerHTML = '<i data-lucide="check-circle"></i> Downloading...';
+            lucide.createIcons();
+            setTimeout(() => {
+                downloadBtn.disabled = false;
+                downloadBtn.innerHTML = '<i data-lucide="download"></i> Download No-Watermark MP4';
+                lucide.createIcons();
+            }, 5000);
         });
     }
 }
