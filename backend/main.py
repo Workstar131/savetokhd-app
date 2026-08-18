@@ -1,18 +1,19 @@
 """
-TikTokExtract API — FastAPI Backend (v2 Architecture)
+TikTokExtract API — FastAPI Backend (v3 - TikWM Proxy Architecture)
 
 Production-grade backend for TikTok video downloading and bulk profile extraction.
 
-NEW ARCHITECTURE (Server-Side Download + Local Cache):
-  - Videos are downloaded to server disk immediately after extraction
-  - Users download from our server (not TikTok CDN) — no 403 issues
-  - Cached files are auto-cleaned after TTL
+NEW ARCHITECTURE (TikWM Proxy):
+  - TikWM has its own video proxy: /video/media/play/{video_id}.mp4
+  - TikWM's servers can access TikTok CDN (they have residential IPs/proxies)
+  - We route downloads through TikWM's proxy — NO CDN blocking issues
+  - Videos are also cached locally for fast repeated downloads
 
 Endpoints:
   GET  /api/health            — Health check
-  POST /api/download-single   — Extract metadata + download video to cache
+  POST /api/download-single   — Extract metadata + return TikWM proxy URL
   POST /api/extract-bulk      — Extract bulk profile metadata
-  GET  /api/get-video/{video_id} — Download cached video from server
+  GET  /api/get-video/{video_id} — Stream video from TikWM proxy (or local cache)
 """
 
 import asyncio
@@ -27,7 +28,7 @@ from typing import Optional
 import httpx
 from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, FileResponse
+from fastapi.responses import JSONResponse, FileResponse, StreamingResponse
 
 from config import settings
 from schemas.payload_models import (
@@ -58,13 +59,8 @@ os.makedirs(VIDEO_CACHE_DIR, exist_ok=True)
 # Cache TTL: 30 minutes
 CACHE_TTL = 30 * 60
 
-# In-memory cache of {video_id: {"path": str, "filename": str, "created": float}}
+# In-memory cache of {tikwm_video_id: {"path": str, "filename": str, "created": float}}
 _video_cache: dict[str, dict] = {}
-
-
-def _generate_video_id(url: str) -> str:
-    """Generate a unique ID for a video based on its CDN URL."""
-    return hashlib.sha256(url.encode()).hexdigest()[:16]
 
 
 def _cleanup_expired_cache():
@@ -82,95 +78,106 @@ def _cleanup_expired_cache():
         del _video_cache[vid]
 
 
-def _download_video_to_cache(cdn_url: str, filename: str, video_id: str) -> bool:
+def _download_video_from_tikwm_proxy(tikwm_video_id: str, filename: str) -> bool:
     """
-    Download a video from CDN URL to local cache.
-    Tries multiple CDN mirror domains in parallel.
+    Download a video from TikWM's proxy endpoint to local cache.
+    TikWM's server handles the TikTok CDN access (bypasses IP blocking).
     Returns True if successful.
     """
-    filepath = os.path.join(VIDEO_CACHE_DIR, f"{video_id}.mp4")
-    
-    # Try the original URL first
-    urls_to_try = [cdn_url]
-    
-    # Generate mirror URLs (replace domain with known TikTok CDN mirrors)
-    from urllib.parse import urlparse, urlunparse
-    parsed = urlparse(cdn_url)
-    path = parsed.path
-    query = parsed.query
-    mirror_domains = [
-        "v16.tokcdn.com",
-        "v16m.tiktokcdn.com",
-        "v19.tiktokcdn.com",
-        "www.tiktok.com",
-    ]
-    for domain in mirror_domains:
-        mirrored = urlunparse((
-            "https",
-            domain,
-            path,
-            "",
-            query,
-            ""
-        ))
-        urls_to_try.append(mirrored)
-    
+    tikwm_url = f"https://www.tikwm.com/video/media/play/{tikwm_video_id}.mp4"
+    filepath = os.path.join(VIDEO_CACHE_DIR, f"{tikwm_video_id}.mp4")
+
     headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
-        "Accept": "video/webm,video/ogg,video/*;q=0.9,application/ogg;q=0.7,audio/*;q=0.6,*/*;q=0.5",
-        "Referer": "https://www.tiktok.com/",
-        "Origin": "https://www.tiktok.com",
+        "User-Agent": "Mozilla/5.0 (Linux; Android 13; SM-G981B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/116.0.0.0 Mobile Safari/537.36",
+        "Referer": "https://www.tikwm.com/",
+        "Accept": "video/mp4,*/*",
     }
-    
-    for attempt_url in urls_to_try:
-        try:
-            with httpx.Client(timeout=60.0, follow_redirects=True, headers=headers) as client:
-                response = client.get(attempt_url)
-                if response.status_code == 200:
-                    content_type = response.headers.get("content-type", "")
-                    # Verify it's actually a video
-                    if "text/html" in content_type.lower():
-                        logger.warning("Mirror returned HTML, skipping: %s", attempt_url[:60])
-                        continue
-                    if len(response.content) < 1000:
-                        logger.warning("Response too small, skipping: %s", attempt_url[:60])
-                        continue
-                    
-                    # Write to file
-                    with open(filepath, "wb") as f:
-                        f.write(response.content)
-                    
-                    logger.info(
-                        "Downloaded video (%.1f MB) from %s -> %s",
-                        len(response.content) / (1024*1024),
-                        attempt_url[:50],
-                        filepath,
-                    )
-                    return True
-                else:
-                    logger.debug("Mirror %s returned %d", attempt_url[:50], response.status_code)
-        except Exception as e:
-            logger.debug("Mirror %s failed: %s", attempt_url[:50], e)
-            continue
-    
+
+    try:
+        with httpx.Client(timeout=120.0, follow_redirects=True, headers=headers) as client:
+            response = client.get(tikwm_url)
+            if response.status_code == 200:
+                content_type = response.headers.get("content-type", "")
+                content_length = response.headers.get("content-length", "0")
+
+                # Verify it's actually a video (not an HTML error page)
+                if "text/html" in content_type.lower():
+                    logger.warning("TikWM proxy returned HTML, skipping")
+                    return False
+                if int(content_length) < 1000:
+                    logger.warning("Response too small (%s bytes), skipping", content_length)
+                    return False
+
+                # Write to file
+                with open(filepath, "wb") as f:
+                    f.write(response.content)
+
+                logger.info(
+                    "Downloaded video (%.1f MB) from TikWM proxy for %s",
+                    len(response.content) / (1024 * 1024),
+                    tikwm_video_id,
+                )
+                return True
+            else:
+                logger.warning("TikWM proxy returned %d for %s", response.status_code, tikwm_video_id)
+    except Exception as e:
+        logger.warning("TikWM proxy download failed for %s: %s", tikwm_video_id, e)
+
     return False
 
 
-async def _async_download_video(cdn_url: str, filename: str, video_id: str):
+async def _async_download_to_cache(tikwm_video_id: str, filename: str):
     """Async wrapper for downloading video to cache (runs in background)."""
     loop = asyncio.get_event_loop()
-    success = await loop.run_in_executor(
-        None, _download_video_to_cache, cdn_url, filename, video_id
-    )
+    success = await loop.run_in_executor(None, _download_video_from_tikwm_proxy, tikwm_video_id, filename)
     if success:
-        _video_cache[video_id] = {
-            "path": os.path.join(VIDEO_CACHE_DIR, f"{video_id}.mp4"),
+        _video_cache[tikwm_video_id] = {
+            "path": os.path.join(VIDEO_CACHE_DIR, f"{tikwm_video_id}.mp4"),
             "filename": filename,
             "created": time.time(),
         }
-        logger.info("Video cached with ID: %s", video_id)
+        logger.info("Video cached: %s", tikwm_video_id)
     else:
-        logger.warning("Failed to download video to cache: %s", video_id)
+        logger.warning("Failed to cache video: %s", tikwm_video_id)
+
+
+async def _stream_from_tikwm_proxy(tikwm_video_id: str, filename: str):
+    """
+    Stream a video directly from TikWM's proxy endpoint.
+    Returns a StreamingResponse that proxies the video to the user.
+    """
+    tikwm_url = f"https://www.tikwm.com/video/media/play/{tikwm_video_id}.mp4"
+
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Linux; Android 13; SM-G981B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/116.0.0.0 Mobile Safari/537.36",
+        "Referer": "https://www.tikwm.com/",
+        "Accept": "video/mp4,*/*",
+    }
+
+    async def stream_gen():
+        async with httpx.AsyncClient(timeout=120.0, follow_redirects=True, headers=headers) as client:
+            async with client.stream("GET", tikwm_url) as response:
+                if response.status_code != 200:
+                    logger.error("TikWM proxy returned %d for %s", response.status_code, tikwm_video_id)
+                    return
+
+                content_type = response.headers.get("content-type", "")
+                if "text/html" in content_type.lower():
+                    logger.error("TikWM proxy returned HTML for %s", tikwm_video_id)
+                    return
+
+                async for chunk in response.aiter_bytes(chunk_size=8192):
+                    yield chunk
+
+    return StreamingResponse(
+        stream_gen(),
+        media_type="video/mp4",
+        headers={
+            "Content-Disposition": f'attachment; filename="{filename}"',
+            "Content-Type": "video/mp4",
+            "Accept-Ranges": "bytes",
+        },
+    )
 
 
 # ─── App ──────────────────────────────────────────────────────────
@@ -239,8 +246,9 @@ async def health_check():
 )
 async def download_single(request: SingleDownloadRequest):
     """
-    Extract metadata for a single TikTok video AND download it to server cache.
-    Returns metadata + a local download URL for the cached video.
+    Extract metadata for a single TikTok video.
+    Returns metadata + TikWM proxy URL for download.
+    Also starts background caching of the video for fast repeated downloads.
     """
     url = request.url.strip()
 
@@ -253,37 +261,35 @@ async def download_single(request: SingleDownloadRequest):
 
     try:
         data = await extract_single_video(url)
-        logger.info("Successfully extracted single video: %s", data.get("title", "unknown"))
-        
-        # Extract the CDN URL
-        cdn_url = data.get("download_url", "")
+        logger.info("Successfully extracted: %s", data.get("title", "unknown"))
+
+        # Extract key data
+        tikwm_video_id = data.get("video_id", "")
+        tikwm_proxy_url = data.get("tikwm_proxy_url", "")
         title = data.get("title", "TikTok Video")
-        
+
         # Generate a safe filename
         safe_title = "".join(c for c in title[:50] if c.isalnum() or c in " _-").strip()
         filename = f"{safe_title}_no_watermark.mp4" if safe_title else "tiktok_video_no_watermark.mp4"
-        
-        # Generate video ID
-        video_id = _generate_video_id(cdn_url)
-        
-        # Start background download to cache
-        # Don't await — let it run in background so the user gets the response quickly
-        asyncio.create_task(_async_download_video(cdn_url, filename, video_id))
-        
-        # Return the response with local download URL
+
+        # Start background download to cache (don't block the response)
+        if tikwm_video_id and tikwm_video_id != "unknown":
+            asyncio.create_task(_async_download_to_cache(tikwm_video_id, filename))
+
+        # Return the response
         result = {
             "title": data.get("title", ""),
             "author": data.get("author", ""),
             "views": data.get("views", ""),
             "thumbnail": data.get("thumbnail", ""),
-            "download_url": cdn_url,
-            "video_id": video_id,
+            "download_url": tikwm_proxy_url,  # Use TikWM proxy URL (not raw CDN)
+            "video_id": tikwm_video_id,
             "filename": filename,
         }
-        
-        logger.info("Returning result with video_id: %s", video_id)
+
+        logger.info("Returning result with TikWM proxy URL: %s", tikwm_proxy_url)
         return JSONResponse(content=result)
-        
+
     except ValueError:
         raise
     except RuntimeError as exc:
@@ -327,98 +333,135 @@ async def extract_bulk(request: BulkExtractRequest):
         )
 
 
-# ─── Get Video (Download from Cache) ──────────────────────────────
+# ─── Get Video (Download) ────────────────────────────────────────
 
 @app.get("/api/get-video/{video_id}", tags=["Download"])
 async def get_video(video_id: str):
     """
-    Download a cached video from the server.
-    The video was pre-downloaded during extraction, so this always works
-    (no TikTok CDN blocking issues).
+    Download a TikTok video.
+    Strategy:
+      1. Check local cache first (fastest)
+      2. If not cached, stream directly from TikWM's proxy
+      3. In parallel, cache for next time
+    TikWM's proxy bypasses CDN IP blocking — their servers handle the CDN access.
     """
     # Cleanup expired cache
     _cleanup_expired_cache()
-    
+
     # Check if video is in cache
-    if video_id not in _video_cache:
-        raise HTTPException(
-            status_code=404,
-            detail="Video not found in cache. Please extract the video again."
-        )
-    
-    cache_info = _video_cache[video_id]
-    filepath = cache_info["path"]
-    filename = cache_info["filename"]
-    
-    if not os.path.exists(filepath):
-        # File was deleted but cache entry still exists
-        del _video_cache[video_id]
-        raise HTTPException(
-            status_code=404,
-            detail="Video file was removed from cache. Please extract again."
-        )
-    
-    logger.info("Serving cached video: %s (%s)", filename, video_id)
-    
-    return FileResponse(
-        path=filepath,
-        media_type="video/mp4",
-        filename=filename,
-        headers={
-            "Content-Disposition": f'attachment; filename="{filename}"',
-        }
-    )
-
-
-# ─── Legacy Proxy Download (kept for backwards compatibility) ─────
-
-@app.api_route("/api/proxy-download", methods=["GET", "HEAD"], tags=["Download"])
-async def proxy_download(
-    url: str = Query(..., description="Encoded TikTok CDN video URL"),
-    filename: Optional[str] = Query(None, description="Desired download filename"),
-):
-    """
-    Legacy proxy endpoint — downloads the video from CDN and returns it.
-    Now uses the cache approach: downloads to disk first, then serves.
-    """
-    if not url:
-        raise HTTPException(status_code=400, detail="Missing 'url' parameter.")
-
-    filename = filename or "tiktok_video_nowatermark.mp4"
-    video_id = _generate_video_id(url)
-    
-    # Check if already cached
     if video_id in _video_cache and os.path.exists(_video_cache[video_id]["path"]):
-        logger.info("Serving already-cached video: %s", video_id)
+        logger.info("Serving cached video: %s", video_id)
         return FileResponse(
             path=_video_cache[video_id]["path"],
             media_type="video/mp4",
             filename=_video_cache[video_id]["filename"],
-            headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+            headers={"Content-Disposition": f'attachment; filename="{_video_cache[video_id]["filename"]}"'},
         )
-    
-    # Try to download to cache
-    loop = asyncio.get_event_loop()
-    success = await loop.run_in_executor(None, _download_video_to_cache, url, filename, video_id)
-    
-    if success:
-        _video_cache[video_id] = {
-            "path": os.path.join(VIDEO_CACHE_DIR, f"{video_id}.mp4"),
-            "filename": filename,
-            "created": time.time(),
-        }
-        return FileResponse(
-            path=os.path.join(VIDEO_CACHE_DIR, f"{video_id}.mp4"),
-            media_type="video/mp4",
-            filename=filename,
-            headers={"Content-Disposition": f'attachment; filename="{filename}"'},
-        )
-    
-    # If download failed, try re-extracting with a fresh URL
-    logger.warning("Direct download failed, trying re-extraction...")
-    raise HTTPException(
-        status_code=502,
-        detail="Failed to download video. Please try extracting again."
+
+    # Not cached — stream from TikWM's proxy
+    logger.info("Streaming from TikWM proxy: %s", video_id)
+
+    # Start background caching for next time
+    if video_id and video_id != "unknown":
+        filename = f"tiktok_{video_id}_no_watermark.mp4"
+        asyncio.create_task(_async_download_to_cache(video_id, filename))
+
+    # Stream from TikWM proxy
+    tikwm_url = f"https://www.tikwm.com/video/media/play/{video_id}.mp4"
+
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Linux; Android 13; SM-G981B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/116.0.0.0 Mobile Safari/537.36",
+        "Referer": "https://www.tikwm.com/",
+        "Accept": "video/mp4,*/*",
+    }
+
+    async def stream_gen():
+        async with httpx.AsyncClient(timeout=120.0, follow_redirects=True, headers=headers) as client:
+            async with client.stream("GET", tikwm_url) as response:
+                if response.status_code != 200:
+                    logger.error("TikWM proxy returned %d for %s", response.status_code, video_id)
+                    raise HTTPException(status_code=502, detail="Failed to fetch video from proxy.")
+
+                content_type = response.headers.get("content-type", "")
+                if "text/html" in content_type.lower():
+                    logger.error("TikWM proxy returned HTML for %s", video_id)
+                    raise HTTPException(status_code=502, detail="Invalid response from proxy.")
+
+                async for chunk in response.aiter_bytes(chunk_size=8192):
+                    yield chunk
+
+    return StreamingResponse(
+        stream_gen(),
+        media_type="video/mp4",
+        headers={
+            "Content-Disposition": f'attachment; filename="tiktok_{video_id}_no_watermark.mp4"',
+            "Content-Type": "video/mp4",
+            "Accept-Ranges": "bytes",
+        },
+    )
+
+
+# ─── Legacy Proxy Download (backwards compatibility) ─────────────
+
+@app.api_route("/api/proxy-download", methods=["GET", "HEAD"], tags=["Download"])
+async def proxy_download(
+    url: str = Query(..., description="TikWM proxy URL or CDN URL"),
+    filename: Optional[str] = Query(None, description="Desired download filename"),
+):
+    """
+    Legacy proxy endpoint.
+    If URL is a TikWM proxy URL, stream from TikWM.
+    If URL is a raw CDN URL, try to extract video_id and use TikWM proxy instead.
+    """
+    if not url:
+        raise HTTPException(status_code=400, detail="Missing 'url' parameter.")
+
+    filename = filename or "tiktok_video_no_watermark.mp4"
+
+    # Check if this is a TikWM proxy URL
+    if "tikwm.com/video/media/" in url:
+        # Extract video_id from URL like: https://www.tikwm.com/video/media/play/VIDEOID.mp4
+        import re
+        match = re.search(r"/video/media/(?:hd)?play/([a-f0-9]+)\.mp4", url)
+        if match:
+            video_id = match.group(1)
+            logger.info("Legacy proxy-download using TikWM proxy for: %s", video_id)
+            # Reuse the same logic as get-video
+            return await get_video(video_id)
+
+    # If it's a raw CDN URL, try to extract the video_id from the CDN path
+    # CDN URLs have the video ID in the path: /video/tos/.../ID/
+    import re
+    cdn_match = re.search(r"/(?:video/tos|[^/]+/tos[^/]*)/[^/]+/([A-Za-z0-9]{10,})/", url)
+    if cdn_match:
+        video_id = cdn_match.group(1)
+        logger.info("Legacy proxy-download converted CDN URL to TikWM proxy for: %s", video_id[:20])
+        return await get_video(video_id)
+
+    # Can't determine video_id — try streaming the URL directly
+    logger.warning("Cannot convert URL to TikWM proxy, streaming directly: %s", url[:60])
+
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Linux; Android 13; SM-G981B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/116.0.0.0 Mobile Safari/537.36",
+        "Referer": "https://www.tiktok.com/",
+        "Accept": "video/mp4,*/*",
+    }
+
+    async def stream_gen():
+        async with httpx.AsyncClient(timeout=60.0, follow_redirects=True, headers=headers) as client:
+            async with client.stream("GET", url) as response:
+                if response.status_code != 200:
+                    raise HTTPException(status_code=502, detail="Failed to fetch video.")
+                async for chunk in response.aiter_bytes(chunk_size=8192):
+                    yield chunk
+
+    return StreamingResponse(
+        stream_gen(),
+        media_type="video/mp4",
+        headers={
+            "Content-Disposition": f'attachment; filename="{filename}"',
+            "Content-Type": "video/mp4",
+        },
     )
 
 

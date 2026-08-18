@@ -453,14 +453,29 @@ async def _submit_tikwm_task(url: str) -> Optional[dict]:
 
 # ─── Schema Conversion ────────────────────────────────────────────
 
+# TikWM proxy URL template - their server proxies the video (bypasses CDN blocking)
+TIKWM_PROXY_URL_TEMPLATE = "https://www.tikwm.com/video/media/play/{video_id}.mp4"
+
+
 def _tikwm_single_result_to_schema(result: dict) -> dict:
-    """Convert TikWM single video result to the SingleVideoResponse schema."""
+    """Convert TikWM single video result to the SingleVideoResponse schema.
+    
+    Also generates the TikWM proxy URL which bypasses CDN IP blocking
+    by routing the video through TikWM's own servers.
+    """
+    video_id = result.get("video_id", "")
+    tikwm_proxy_url = ""
+    if video_id and video_id != "unknown":
+        tikwm_proxy_url = TIKWM_PROXY_URL_TEMPLATE.format(video_id=video_id)
+    
     return {
         "title": safe_caption(result.get("desc", "")),
         "author": f"@{result.get('username', 'unknown')}",
         "views": format_views(result.get("view_count", 0)),
         "thumbnail": result.get("cover", ""),
         "download_url": result.get("play_url", ""),
+        "tikwm_proxy_url": tikwm_proxy_url,
+        "video_id": video_id,
     }
 
 
