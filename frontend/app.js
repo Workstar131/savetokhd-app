@@ -105,22 +105,19 @@ async function handleSingleDownload() {
     const url = elements.inputSingle.value.trim();
     if (!url) return showError("Please enter a TikTok video URL.");
     if (!url.includes('tiktok.com')) return showError("Please enter a valid TikTok URL.");
-
     showLoading("Connecting to TikTok server...");
-    
     try {
         const response = await fetch(`${API_BASE_URL}/download-single`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ url })
         });
-        
         if (!response.ok) {
             const errorData = await response.json();
             throw new Error(errorData.detail || 'Failed to process video');
         }
-        
         const data = await response.json();
+        data.original_url = url; // Store original URL for fresh re-extraction on download
         renderSingleResult(data);
     } catch (err) {
         showError(err.message || "Failed to fetch video. Please try again later.");
@@ -137,8 +134,9 @@ async function handleSingleDownload() {
 function renderSingleResult(data) {
     elements.results.classList.remove('hidden');
     
-    // Store the download URL in a data attribute for the click handler
+    // Store the download URL and original TikTok URL in data attributes
     const downloadUrl = data.download_url;
+    const originalTikTokUrl = data.original_url || '';
     
     elements.results.innerHTML = `
         <div class="bg-gray-900 border border-gray-700 rounded-xl overflow-hidden flex flex-col md:flex-row">
@@ -162,6 +160,7 @@ function renderSingleResult(data) {
                 <div class="space-y-3">
                     <button id="btn-download-media"
                             data-download-url="${escapeHTML(downloadUrl)}"
+                            data-original-tiktok-url="${escapeHTML(originalTikTokUrl)}"
                             data-filename="${escapeHTML(sanitizeFilename(data.title))}"
                             class="w-full bg-green-600 hover:bg-green-700 py-3 rounded-lg font-bold text-center transition flex items-center justify-center gap-2 text-white cursor-pointer">
                         <i data-lucide="download"></i> Download No-Watermark MP4
@@ -173,36 +172,50 @@ function renderSingleResult(data) {
     lucide.createIcons();
     
     // Attach click handler for proper download
-    // Navigate to our server's proxy-download endpoint which either:
-    // 1. Streams the video directly (if server can access CDN)
-    // 2. Returns an HTML page with JS that forces browser-side download
-    //    (when server is blocked from CDN domains)
+    // Step 1: Re-fetch a FRESH CDN URL from the server (old ones expire in minutes)
+    // Step 2: Navigate to the proxy-download endpoint with the fresh URL
     const downloadBtn = document.getElementById('btn-download-media');
+    const btnOriginalUrl = downloadBtn ? (downloadBtn.getAttribute('data-original-url') || downloadBtn.getAttribute('data-original-tiktok-url')) : null;
+    
     if (downloadBtn) {
-        downloadBtn.addEventListener('click', (e) => {
+        downloadBtn.addEventListener('click', async (e) => {
             e.preventDefault();
-            const videoUrl = downloadBtn.getAttribute('data-download-url');
-            if (!videoUrl) {
-                alert('No download URL available.');
-                return;
+            
+            let finalDownloadUrl = downloadBtn.getAttribute('data-download-url');
+            const filename = downloadBtn.getAttribute('data-filename') || 'tiktok_video_no_watermark.mp4';
+            
+            // Step 1: Get a fresh CDN URL by re-extracting from the original TikTok URL
+            if (btnOriginalUrl) {
+                downloadBtn.disabled = true;
+                downloadBtn.innerHTML = '<i data-lucide="loader" class="w-5 h-5 animate-spin"></i> Getting fresh link...';
+                lucide.createIcons();
+                
+                try {
+                    const resp = await fetch(`${API_BASE_URL}/download-single`, {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ url: btnOriginalUrl })
+                    });
+                    const data = await resp.json();
+                    if (data && data.download_url) {
+                        finalDownloadUrl = data.download_url || finalDownloadUrl;
+                    } else if (data && data.data && Array.isArray(data.data) && data.data.length > 0) {
+                        finalDownloadUrl = data.data[0].download_url || data.data[0].url || finalDownloadUrl;
+                    }
+                } catch (err) {
+                    console.warn('Could not re-fetch fresh URL, using cached one:', err);
+                }
             }
             
-            const filename = downloadBtn.getAttribute('data-filename') || 'tiktok_video_no_watermark.mp4';
-            const proxyUrl = `${API_BASE_URL}/proxy-download?url=${encodeURIComponent(videoUrl)}&filename=${encodeURIComponent(filename)}`;
-            
-            // Navigate to the proxy endpoint — it will either stream the video
-            // or serve an HTML page that triggers the download via browser JS
+            // Step 2: Navigate to proxy-download with the (hopefully fresh) URL
+            const proxyUrl = `${API_BASE_URL}/proxy-download?url=${encodeURIComponent(finalDownloadUrl)}&filename=${encodeURIComponent(filename)}`;
             window.location.href = proxyUrl;
             
-            // Show feedback
-            downloadBtn.disabled = true;
-            downloadBtn.innerHTML = '<i data-lucide="check-circle"></i> Starting download...';
-            lucide.createIcons();
             setTimeout(() => {
                 downloadBtn.disabled = false;
                 downloadBtn.innerHTML = '<i data-lucide="download"></i> Download No-Watermark MP4';
                 lucide.createIcons();
-            }, 3000);
+            }, 5000);
         });
     }
 }
