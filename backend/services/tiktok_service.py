@@ -294,11 +294,26 @@ async def _submit_tikwm_v2(url: str) -> Optional[dict]:
             duration = data.get("duration") or 0
             title = data.get("title") or ""
 
+            # Extract video_id from multiple sources (most reliable first)
+            # 1. From the original TikTok URL (always works if URL is well-formed)
+            video_id = extract_video_id_from_url(url) or ""
+            # 2. From TikWM response fields
+            if not video_id:
+                video_id = str(data.get("id", "")) or str(data.get("aweme_id", "")) or ""
+            # 3. From CDN URL path
+            if not video_id and final_url:
+                m = re.search(r"/(\d{15,20})[._]", final_url)
+                if m:
+                    video_id = m.group(1)
+            # 4. Fallback
+            if not video_id:
+                video_id = "unknown"
+
             return {
                 "play_url": final_url,
                 "cover": cover,
                 "username": username,
-                "video_id": str(data.get("id", "")) or extract_video_id_from_url(url) or "unknown",
+                "video_id": video_id,
                 "create_time": data.get("create_time") or data.get("createTime"),
                 "desc": title or safe_caption(data.get("title", "")),
                 "images": data.get("images") or [],
