@@ -173,8 +173,10 @@ function renderSingleResult(data) {
     lucide.createIcons();
     
     // Attach click handler for proper download
-    // Use an <a> tag with download attribute — avoids CORS issues entirely
-    // and forces the browser to save the file instead of playing inline.
+    // Navigate to our server's proxy-download endpoint which either:
+    // 1. Streams the video directly (if server can access CDN)
+    // 2. Returns an HTML page with JS that forces browser-side download
+    //    (when server is blocked from CDN domains)
     const downloadBtn = document.getElementById('btn-download-media');
     if (downloadBtn) {
         downloadBtn.addEventListener('click', (e) => {
@@ -186,31 +188,21 @@ function renderSingleResult(data) {
             }
             
             const filename = downloadBtn.getAttribute('data-filename') || 'tiktok_video_no_watermark.mp4';
-            const proxyUrl = `${API_BASE_URL}/proxy-download?url=${encodeURIComponent(videoUrl)}`;
+            const proxyUrl = `${API_BASE_URL}/proxy-download?url=${encodeURIComponent(videoUrl)}&filename=${encodeURIComponent(filename)}`;
             
-            // Create an anchor element with the download attribute
-            // This navigates the browser to our proxy endpoint which:
-            // 1. Tries to stream the video directly (if server can access CDN)
-            // 2. Falls back to 302 redirect to CDN (browser can access it directly)
-            // The 'download' attribute forces save-as behavior in most browsers.
-            const a = document.createElement('a');
-            a.href = proxyUrl;
-            a.download = filename;
-            a.target = '_self';
-            a.rel = 'noopener';
-            document.body.appendChild(a);
-            a.click();
-            document.body.removeChild(a);
+            // Navigate to the proxy endpoint — it will either stream the video
+            // or serve an HTML page that triggers the download via browser JS
+            window.location.href = proxyUrl;
             
-            // Also hide the button temporarily to prevent double-clicks
+            // Show feedback
             downloadBtn.disabled = true;
-            downloadBtn.innerHTML = '<i data-lucide="check-circle"></i> Downloading...';
+            downloadBtn.innerHTML = '<i data-lucide="check-circle"></i> Starting download...';
             lucide.createIcons();
             setTimeout(() => {
                 downloadBtn.disabled = false;
                 downloadBtn.innerHTML = '<i data-lucide="download"></i> Download No-Watermark MP4';
                 lucide.createIcons();
-            }, 5000);
+            }, 3000);
         });
     }
 }
